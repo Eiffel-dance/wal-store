@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import app
 from app import WalCorruptionError, WalStore
@@ -124,6 +125,224 @@ class RecoverTest(unittest.TestCase):
         )
         with self.assertRaises(WalCorruptionError):
             WalStore(self.path)
+
+
+class DurabilityTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def test_seq_monotonic_across_reopens(self):
+        s = WalStore(self.path)
+        self.assertEqual(s.set("a", 1), None)
+        self.assertEqual(s.commit(), 1)
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(s.commit(), 3)  # empty commit advances seq
+
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.commit_seq, 3)
+        self.assertEqual(s2.state, {"a": 1, "b": 2})
+        self.assertEqual(s2.commit(), 4)  # empty commit after reopen
+
+        s3 = WalStore(self.path)
+        self.assertEqual(s3.commit_seq, 4)
+        self.assertEqual(s3.state, {"a": 1, "b": 2})
+        # committed seq stays strictly increasing
+        seqs = [s3.commit() for _ in range(3)]
+        self.assertEqual(seqs, [5, 6, 7])
+
+    def test_state_only_changes_at_commit(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        self.assertEqual(s.state, {})  # deferred until commit
+        s.commit()
+        self.assertEqual(s.state, {"a": 1})
+        s.delete("a")
+        self.assertEqual(s.state, {"a": 1})  # delete deferred too
+        s.delete("missing")  # deleting absent key is not an error
+        s.commit()
+        self.assertEqual(s.state, {})
+
+    def test_successive_uncommitted_batches_after_reopen(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        # first uncommitted batch (abandoned)
+        s.set("b", 2)
+        s.delete("a")
+        # reopen simulates termination before commit: pending tail ignored/counted
+        s2 = WalStore(self.path)
+        r = s2.recover()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 2)
+        # attribute access on the result keeps working
+        self.assertEqual((r.state, r.commit_seq, r.pending_count), ({"a": 1}, 1, 2))
+
+        # second uncommitted batch
+        s2.set("c", 3)
+        s3 = WalStore(self.path)
+        r = s3.recover()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 3)  # old tail + new record
+
+    def test_termination_after_commit_is_durable(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", [1, 2])
+        seq = s.commit()
+        self.assertEqual(seq, 1)
+        s2 = WalStore(self.path)  # "process restarted"
+        self.assertEqual(s2.state, {"a": 1, "b": [1, 2]})
+        self.assertEqual(s2.commit_seq, 1)
+
+    def test_termination_before_commit_recovers_earlier_state(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("a", 2)
+        s.set("c", 3)
+        s.delete("a")
+        # no commit; reopen must show only the earlier committed state
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.state, {"a": 1})
+        self.assertEqual(s2.commit_seq, 1)
+        r = s2.recover()
+        self.assertEqual(r["pending_count"], 3)
+
+    def test_commit_record_fsyncs_before_returning(self):
+        # The commit boundary must be flushed and fsynced before commit()
+        # returns, otherwise an abrupt termination could lose it.
+        s = WalStore(self.path)
+        s.set("a", 1)
+        with mock.patch("app.os.fsync", autospec=True) as fsync:
+            seq = s.commit()
+            self.assertEqual(seq, 1)
+            self.assertGreaterEqual(fsync.call_count, 1)
+
+    def test_set_record_fsyncs_before_returning(self):
+        s = WalStore(self.path)
+        with mock.patch("app.os.fsync", autospec=True) as fsync:
+            s.set("a", 1)
+            self.assertGreaterEqual(fsync.call_count, 1)
+            # durability on reopen is observable via a real fresh instance
+        self.assertEqual(WalStore(self.path).recover()["pending_count"], 1)
+
+    def test_write_failure_on_commit_raises_oserror_and_keeps_state(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+
+        def boom(fd):
+            raise OSError("disk on fire")
+
+        with mock.patch("app.os.fsync", side_effect=boom):
+            with self.assertRaises(OSError):
+                s.commit()
+        # seq not consumed, no faked committed state
+        self.assertEqual(s.commit_seq, 1)
+        self.assertEqual(s.state, {"a": 1})
+
+        # the failed commit boundary must not appear in the log on reopen
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.commit_seq, 1)
+        self.assertEqual(s2.state, {"a": 1})
+
+    def test_write_failure_on_set_raises_oserror_and_no_pending_record(self):
+        s = WalStore(self.path)
+
+        def boom(fd):
+            raise OSError("disk on fire")
+
+        with mock.patch("app.os.fsync", side_effect=boom):
+            with self.assertRaises(OSError):
+                s.set("a", 1)
+        self.assertEqual(s.state, {})
+        self.assertEqual(s.commit_seq, 0)
+        # retry after the transient failure works with the same seq chain
+        s.set("a", 1)
+        self.assertEqual(s.commit(), 1)
+        self.assertEqual(WalStore(self.path).state, {"a": 1})
+
+    def test_failed_commit_does_not_block_next_seq(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()  # seq 1
+
+        with mock.patch("app.os.fsync", side_effect=OSError("transient")):
+            with self.assertRaises(OSError):
+                s.commit()
+        self.assertEqual(s.commit_seq, 1)
+        # next successful commit is exactly seq 2, never skipped
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(WalStore(self.path).commit_seq, 2)
+
+    def test_corruption_after_reopen_reports_only_corruption_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"')  # truncated pending record
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_corruption_in_committed_region_on_reopen(self):
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "b", "value": 2, "seq": 1},  # stale seq chain
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_non_string_op_is_corruption_not_typeerror(self):
+        self.write_lines(json.dumps({"op": 123, "seq": 1}))
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        self.write_lines(json.dumps({"op": None, "seq": 1}))
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_result_is_independent_copy_of_storage(self):
+        s = WalStore(self.path)
+        s.set("a", {"n": [1]})
+        s.commit()
+        r = s.recover()
+        r["state"]["a"]["n"].append(99)
+        r["state"]["b"] = 2
+        self.assertEqual(s.state, {"a": {"n": [1]}})
+        self.assertEqual(WalStore(self.path).state, {"a": {"n": [1]}})
+
+    def test_recovery_is_deterministic_under_same_prefix(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", 2)
+        s.delete("a")
+        s.set("a", 3)
+        s.commit()
+        s.set("z", 9)
+
+        results = []
+        for _ in range(3):
+            rs = WalStore(self.path)
+            results.append((dict(rs.recover()), rs.state, rs.commit_seq))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+        r0 = results[0][0]
+        self.assertEqual(r0["state"], {"a": 3, "b": 2})  # original batch order
+        self.assertEqual(r0["commit_seq"], 1)
+        self.assertEqual(r0["pending_count"], 1)
 
 
 if __name__ == "__main__":

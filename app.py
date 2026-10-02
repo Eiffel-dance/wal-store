@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 
 
@@ -32,19 +33,61 @@ class WalStore:
         self.recover()
 
     def _append(self, row):
+        """Durably append one log record.
+
+        Raises OSError if the record cannot be written or synced; the
+        un-durable tail is best-effort truncated back so a failed write can
+        never masquerade as a committed record on reopen.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, sort_keys=True) + "\n"
+        created = not self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, sort_keys=True) + "\n")
+            saved_size = f.tell()
+            try:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                try:
+                    f.truncate(saved_size)
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+                raise
+        if created:
+            self._fsync_parent_dir()
+
+    def _fsync_parent_dir(self):
+        """Best-effort persistence of a freshly created log file's directory entry."""
+        try:
+            fd = os.open(str(self.path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            # Some filesystems do not support fsync on directories; the log
+            # contents themselves have already been synced.
+            pass
+        finally:
+            os.close(fd)
 
     def set(self, key, value):
-        self._append({"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1})
+        self._append(
+            {"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1}
+        )
 
     def delete(self, key):
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
     def commit(self):
-        self.commit_seq += 1
-        self._append({"op": "commit", "seq": self.commit_seq})
+        # Persist the commit boundary first and only adopt the new seq/state
+        # once it is durable: a failed write must neither consume the seq nor
+        # present a committed state.
+        seq = self.commit_seq + 1
+        self._append({"op": "commit", "seq": seq})
         self.recover()
         return self.commit_seq
 
@@ -64,12 +107,15 @@ class WalStore:
                     raise WalCorruptionError("invalid JSON record: %r" % line) from exc
                 if not isinstance(row, dict):
                     raise WalCorruptionError("record is not an object: %r" % (row,))
-                schema = _SCHEMAS.get(row.get("op"))
+                op = row.get("op")
+                if not isinstance(op, str):
+                    raise WalCorruptionError("op is not a string: %r" % (op,))
+                schema = _SCHEMAS.get(op)
                 if schema is None:
-                    raise WalCorruptionError("unknown op: %r" % (row.get("op"),))
+                    raise WalCorruptionError("unknown op: %r" % (op,))
                 if set(row) != schema:
                     raise WalCorruptionError(
-                        "bad fields for op %r: %r" % (row["op"], sorted(row))
+                        "bad fields for op %r: %r" % (op, sorted(row))
                     )
                 seq = row["seq"]
                 if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
@@ -78,7 +124,8 @@ class WalStore:
                     raise WalCorruptionError(
                         "seq %r does not follow committed seq %r" % (seq, committed)
                     )
-                if row["op"] == "commit":
+                if op == "commit":
+                    # Apply this batch in original set/delete order.
                     for p in pending:
                         if p["op"] == "delete":
                             candidate.pop(p["key"], None)
@@ -91,6 +138,8 @@ class WalStore:
         return candidate, committed, len(pending)
 
     def recover(self):
+        # Replay purely into local objects first; raising WalCorruptionError
+        # must never partially replace the current in-memory state.
         candidate, committed, pending_count = self._replay()
         self.state = candidate
         self.commit_seq = committed
