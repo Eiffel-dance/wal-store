@@ -332,9 +332,11 @@ class WalStore:
             # literal U+2028/U+2029 inside a JSON string is emitted escaped by
             # json.dumps, so a legal record can never be fragmented. An empty
             # file yields no segments at all (empty store). Only the final
-            # segment can lack a terminator, and only an unterminated final
-            # segment can be the partial record of an interrupted write: a
-            # complete record write always ends with its newline.
+            # segment can lack a terminator, and the terminator is the
+            # boundary that makes a record adoptable: a complete record write
+            # always ends with its newline, so an unterminated final segment
+            # is the unfinished tail of an interrupted write -- even when its
+            # bytes happen to parse as a complete, fully valid record.
             segments = text.splitlines(keepends=True)
             last = len(segments) - 1
             for i, seg in enumerate(segments):
@@ -402,6 +404,15 @@ class WalStore:
                         raise
                     except ValueError as exc:
                         raise WalCorruptionError(str(exc)) from exc
+                if not terminated:
+                    # The record's terminator never became durable, so the
+                    # write is unfinished: the fragment is discarded whole --
+                    # not applied, not counted as pending, and its bytes stay
+                    # beyond valid_size for a later append or rollback to
+                    # remove. Validation above has already run, so only a
+                    # fragment that is recognisably one complete record
+                    # reaches this point; anything else raised already.
+                    break
                 if op == "commit":
                     # Apply this batch in original set/delete order.
                     for p in pending:
