@@ -746,5 +746,134 @@ class QueryTest(unittest.TestCase):
         self.assertIs(s.contains("other"), False)
 
 
+class SnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()  # seq 1: {"a": 1, "b": {"n": [1]}}
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()  # seq 2: {"b": {"n": [1]}, "c": 3}
+        s.commit()  # seq 3: empty commit, same state
+        s.set("tail", 9)  # uncommitted
+        return s
+
+    def test_default_targets_latest_commit(self):
+        s = self.build()
+        snap = s.snapshot()
+        self.assertEqual(set(snap), {"state", "commit_seq"})
+        self.assertEqual(snap["commit_seq"], 3)
+        self.assertEqual(snap["state"], {"b": {"n": [1]}, "c": 3})
+
+    def test_empty_log_snapshots(self):
+        s = WalStore(self.path)
+        for snap in (s.snapshot(), s.snapshot(0)):
+            self.assertEqual(snap["state"], {})
+            self.assertEqual(snap["commit_seq"], 0)
+
+    def test_historical_commits(self):
+        s = self.build()
+        self.assertEqual(s.snapshot(0), {"state": {}, "commit_seq": 0})
+        self.assertEqual(
+            s.snapshot(1), {"state": {"a": 1, "b": {"n": [1]}}, "commit_seq": 1}
+        )
+        self.assertEqual(
+            s.snapshot(2), {"state": {"b": {"n": [1]}, "c": 3}, "commit_seq": 2}
+        )
+        self.assertEqual(
+            s.snapshot(3), {"state": {"b": {"n": [1]}, "c": 3}, "commit_seq": 3}
+        )
+
+    def test_uncommitted_tail_never_visible(self):
+        s = self.build()
+        for snap in (s.snapshot(), s.snapshot(3), s.snapshot(2), s.snapshot(1)):
+            self.assertNotIn("tail", snap["state"])
+
+    def test_invalid_target_seq_raises_valueerror(self):
+        s = self.build()
+        for bad in (True, False, -1, 1.0, "1", b"1", [1], {"s": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.snapshot(bad)
+        with self.assertRaises(ValueError):
+            s.snapshot(4)  # beyond latest commit
+        with self.assertRaises(ValueError):
+            s.snapshot(10**9)
+
+    def test_result_is_independent_deep_copy(self):
+        s = self.build()
+        snap = s.snapshot(1)
+        snap["state"]["b"]["n"].append(99)
+        snap["state"]["x"] = 1
+        self.assertEqual(s.snapshot(1)["state"], {"a": 1, "b": {"n": [1]}})
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(WalStore(self.path).snapshot(1)["state"], {"a": 1, "b": {"n": [1]}})
+
+    def test_deterministic_across_calls_and_reopens(self):
+        s = self.build()
+        first = s.snapshot(2)
+        for _ in range(3):
+            self.assertEqual(s.snapshot(2), first)
+            self.assertEqual(WalStore(self.path).snapshot(2), first)
+
+    def test_snapshot_is_read_only(self):
+        s = self.build()
+        size = self.log_size()
+        for target in (None, 0, 1, 2, 3):
+            s.snapshot() if target is None else s.snapshot(target)
+        self.assertEqual(self.log_size(), size)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.recover()["pending_count"], 1)
+
+    def test_corruption_anywhere_raises_no_partial_snapshot(self):
+        s = self.build()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"}\n')  # invalid record, terminated
+        for target in (None, 0, 1, 2, 3):
+            with self.assertRaises(WalCorruptionError, msg=target):
+                s.snapshot() if target is None else s.snapshot(target)
+        # in-memory state untouched
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+
+    def test_tail_fragment_does_not_affect_snapshot(self):
+        s = self.build()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "frag"')  # interrupted write
+        size = self.log_size()
+        snap = s.snapshot()
+        self.assertEqual(snap["state"], {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(snap["commit_seq"], 3)
+        self.assertEqual(self.log_size(), size)  # fragment left in place
+
+    def test_legacy_log_serves_snapshots(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "k", "value": 2, "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(s.snapshot(1)["state"], {"k": 1})
+        self.assertEqual(s.snapshot()["state"], {"k": 2})
+
+
 if __name__ == "__main__":
     unittest.main()

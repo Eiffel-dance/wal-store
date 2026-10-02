@@ -308,7 +308,52 @@ class WalStore:
         state, _committed = self._committed_view()
         return key in state
 
-    def _replay(self):
+    def snapshot(self, target_seq=None):
+        """Read-only view of the committed state at a past commit boundary.
+
+        The whole log is parsed under the exact recovery rules first -- any
+        corruption anywhere in it raises WalCorruptionError, never a partial
+        snapshot -- and only batches up to the target commit are replayed
+        into the result. Records committed after the target and the
+        uncommitted tail never appear in it. target_seq defaults to the
+        latest committed seq; 0 yields the empty state. The log, the public
+        state, and commit_seq are never touched.
+        """
+        history = []
+        _candidate, committed, _pending, _valid_size, _committed_size = self._replay(
+            snapshots=history
+        )
+        if target_seq is None:
+            target_seq = committed
+        elif (
+            isinstance(target_seq, bool)
+            or not isinstance(target_seq, int)
+            or target_seq < 0
+        ):
+            raise ValueError(
+                "target_seq must be a non-negative integer, got %r" % (target_seq,)
+            )
+        if target_seq > committed:
+            raise ValueError(
+                "target_seq %r exceeds latest committed seq %r"
+                % (target_seq, committed)
+            )
+        if target_seq == 0:
+            state = {}
+        else:
+            # Commit seqs are contiguous from 1, so the target's view is
+            # exactly the entry recorded at that commit boundary. It is
+            # already a deep copy private to this call, so the caller may
+            # mutate the result freely without affecting the store.
+            state = dict(history)[target_seq]
+        return RecoveryResult(state=state, commit_seq=target_seq)
+
+    def _replay(self, snapshots=None):
+        # snapshots: optional caller-provided list; when given, one
+        # (seq, deep-copy-of-state) entry per durable commit record is
+        # appended, in commit order, so historical committed views can be
+        # served without re-parsing the log. Purely observational: the
+        # replay itself, its return value, and the log are unaffected.
         candidate = {}
         pending = []
         committed = 0
@@ -422,6 +467,10 @@ class WalStore:
                             candidate[p["key"]] = p["value"]
                     pending = []
                     committed = seq
+                    if snapshots is not None:
+                        # An independent deep copy taken at the commit
+                        # boundary; later batches must never mutate it.
+                        snapshots.append((seq, copy.deepcopy(candidate)))
                 else:
                     pending.append(row)
                 # The segment round-trips to its original bytes, so this is
