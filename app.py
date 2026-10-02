@@ -29,6 +29,11 @@ _SCHEMAS = {
 # true/false).
 
 
+# Sentinel distinguishing "no default given to get()" from a caller passing
+# default=None, which is an ordinary (and storable) value.
+_UNSET = object()
+
+
 def _validate_key(key):
     if not isinstance(key, str):
         raise ValueError("key must be a string, got %r" % (type(key).__name__,))
@@ -153,6 +158,35 @@ class WalStore:
         self._append({"op": "commit", "seq": seq})
         self.recover()
         return self.commit_seq
+
+    def _committed_view(self):
+        # Replay the log purely into local objects, exactly like recovery, but
+        # never adopt the result: a query must observe the last durable commit
+        # even when newer uncommitted records sit in the tail, and a corrupt
+        # record (in the tail or the committed region) raises WalCorruptionError
+        # without partially replacing the current in-memory state.
+        candidate, committed, _pending = self._replay()
+        return candidate, committed
+
+    def get(self, key, default=_UNSET):
+        _validate_key(key)
+        if default is not _UNSET:
+            _validate_value(default)
+        state, _committed = self._committed_view()
+        if key in state:
+            # An independent deep copy: mutating a returned nested dict or list
+            # must not affect state, later queries, or a reopened store.
+            return copy.deepcopy(state[key])
+        if default is not _UNSET:
+            # A stored None (key in state) and a missing key never collapse:
+            # presence above returns the stored value, even when it is None.
+            return copy.deepcopy(default)
+        raise KeyError(key)
+
+    def contains(self, key):
+        _validate_key(key)
+        state, _committed = self._committed_view()
+        return key in state
 
     def _replay(self):
         candidate = {}
