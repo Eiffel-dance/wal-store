@@ -88,6 +88,20 @@ def _reject_constant(constant):
     raise WalCorruptionError("non-standard JSON constant %r" % (constant,))
 
 
+def _reject_duplicate_keys(pairs):
+    # A JSON object with repeated member names is corruption even when the
+    # repeated values are identical; the default last-wins behaviour would
+    # silently mutate replay semantics. The hook runs for every object,
+    # including nested ones, while the surrounding record is being parsed,
+    # i.e. before any candidate state can be adopted.
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise WalCorruptionError("duplicate field name in record: %r" % (key,))
+        seen.add(key)
+    return dict(pairs)
+
+
 class WalStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -197,10 +211,27 @@ class WalStore:
                 text = self.path.read_text(encoding="utf-8")
             except UnicodeDecodeError as exc:
                 raise WalCorruptionError("log is not valid UTF-8") from exc
+            # splitlines() recognises every Unicode line boundary, while a
+            # literal U+2028/U+2029 inside a JSON string is emitted escaped by
+            # json.dumps, so a legal record can never be fragmented. It absorbs
+            # the single terminator that ends the final record, and an empty
+            # file yields no lines at all (empty store); any fragment that
+            # remains empty or whitespace-only -- a blank line between records,
+            # a bare empty record, or a second terminator at end of file -- is
+            # therefore corruption and is rejected up front, before any
+            # candidate state can be adopted.
             for line in text.splitlines():
+                if not line.strip():
+                    raise WalCorruptionError("empty record in log")
                 try:
-                    row = json.loads(line, parse_constant=_reject_constant)
-                except json.JSONDecodeError as exc:
+                    row = json.loads(
+                        line,
+                        parse_constant=_reject_constant,
+                        object_pairs_hook=_reject_duplicate_keys,
+                    )
+                except WalCorruptionError:
+                    raise
+                except (json.JSONDecodeError, TypeError) as exc:
                     raise WalCorruptionError("invalid JSON record: %r" % line) from exc
                 if not isinstance(row, dict):
                     raise WalCorruptionError("record is not an object: %r" % (row,))
