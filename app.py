@@ -348,6 +348,59 @@ class WalStore:
             state = dict(history)[target_seq]
         return RecoveryResult(state=state, commit_seq=target_seq)
 
+    def audit(self):
+        """Read-only audit of the accepted prefix and any trailing fragment.
+
+        Parses the log under exactly the same rules as recover -- UTF-8,
+        JSON, field sets, seq continuity, and the terminator adoption
+        boundary -- but never adopts the result: state and commit_seq are
+        left untouched and the log is never truncated, rewritten, or
+        appended to. Returns the recover triple plus three byte counters:
+          valid_bytes     bytes from the start through the end of the last
+                         terminated, accepted record (the committed prefix
+                         plus any uncommitted set/delete records);
+          committed_bytes byte offset just past the last commit record
+                         (0 when there is no commit record);
+          tail_bytes     file size minus valid_bytes: the unfinished
+                         trailing write fragment only.
+        A final segment without its terminator counts solely in tail_bytes
+        when recover would recognise it either as an unfinished JSON prefix
+        or as one complete record passing every structural, field, and seq
+        check; it is never applied, counted as pending, or allowed to
+        advance commit_seq, and truncated UTF-8 bytes are likewise counted
+        only as fragment bytes. Anything else after the accepted prefix
+        (blank lines, trailing whitespace, illegal UTF-8, non-standard JSON
+        constants, duplicate fields, a wrong field set, a seq break, or any
+        other unrecognisable, non-unfinished content) raises
+        WalCorruptionError with no partial result and no change to the
+        in-memory state. Repeated calls, including on a reopened instance,
+        return identical fields and values.
+        """
+        # _replay caches the accepted-prefix length on the instance for a
+        # later append; audit is purely observational and must not influence
+        # that decision, so restore whatever was cached before (the replay
+        # itself builds only local objects and never touches self.state).
+        saved_valid_size = self._valid_size
+        try:
+            (
+                candidate,
+                committed,
+                pending_count,
+                valid_size,
+                committed_size,
+            ) = self._replay()
+        finally:
+            self._valid_size = saved_valid_size
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        return RecoveryResult(
+            state=copy.deepcopy(candidate),
+            commit_seq=committed,
+            pending_count=pending_count,
+            valid_bytes=valid_size,
+            committed_bytes=committed_size,
+            tail_bytes=file_size - valid_size,
+        )
+
     def _replay(self, snapshots=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is

@@ -875,5 +875,375 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(s.snapshot()["state"], {"k": 2})
 
 
+class AuditTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def line_end(self, n):
+        # Byte offset just past the nth newline-terminated line of the file.
+        data = self.path.read_bytes()
+        pos = -1
+        for _ in range(n):
+            pos = data.index(b"\n", pos + 1)
+        return pos + 1
+
+    def test_nonexistent_and_empty_log(self):
+        s = WalStore(self.path)  # path does not exist
+        r = s.audit()
+        self.assertEqual(
+            set(r),
+            {"state", "commit_seq", "pending_count",
+             "valid_bytes", "committed_bytes", "tail_bytes"},
+        )
+        self.assertEqual(
+            (r.state, r.commit_seq, r.pending_count), ({}, 0, 0)
+        )
+        self.assertEqual(
+            (r.valid_bytes, r.committed_bytes, r.tail_bytes), (0, 0, 0)
+        )
+        self.path.write_bytes(b"")
+        self.assertEqual(dict(s.audit()), dict(r))
+
+    def test_nonexistent_log_never_created_by_audit(self):
+        s = WalStore(self.path)
+        for _ in range(2):
+            s.audit()
+        self.assertFalse(self.path.exists())
+
+    def test_empty_file_created_on_disk(self):
+        self.path.write_bytes(b"")
+        s = WalStore(self.path)
+        r = s.audit()
+        self.assertEqual(r["state"], {})
+        self.assertEqual(
+            (r.commit_seq, r.pending_count,
+             r.valid_bytes, r.committed_bytes, r.tail_bytes),
+            (0, 0, 0, 0, 0),
+        )
+
+    def test_committed_prefix_and_uncommitted_records(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", 2)
+        s.commit()
+        s.set("c", 3)
+        s.delete("a")
+        size = self.path.stat().st_size
+        r = s.audit()
+        # recover triple is exactly what recover() reports
+        rec = s.recover()
+        self.assertEqual(
+            (r["state"], r["commit_seq"], r["pending_count"]),
+            (rec["state"], rec["commit_seq"], rec["pending_count"]),
+        )
+        self.assertEqual(r["state"], {"a": 1, "b": 2})
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (1, 2))
+        # every record is terminated and accepted: valid prefix is the file
+        self.assertEqual(r["valid_bytes"], size)
+        self.assertEqual(r["tail_bytes"], 0)
+        # committed prefix ends after the commit record (2 set lines + commit)
+        self.assertEqual(r["committed_bytes"], self.line_end(3))
+        self.assertLessEqual(r["committed_bytes"], r["valid_bytes"])
+
+    def test_no_commit_means_committed_bytes_zero(self):
+        self.write_lines({"op": "set", "key": "a", "value": 1, "seq": 1})
+        s = WalStore(self.path)
+        r = s.audit()
+        self.assertEqual(r["state"], {})
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (0, 1))
+        self.assertEqual(r["committed_bytes"], 0)
+        self.assertEqual(r["valid_bytes"], self.path.stat().st_size)
+        self.assertEqual(r["tail_bytes"], 0)
+
+    def test_empty_commit_committed_bytes_advances(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.commit()
+        r = s.audit()
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (2, 0))
+        self.assertEqual(r["committed_bytes"], self.path.stat().st_size)
+        self.assertEqual(
+            (r["valid_bytes"], r["tail_bytes"]),
+            (self.path.stat().st_size, 0),
+        )
+
+    def test_tail_fragment_json_prefix_counts_only_as_tail(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        fragment = '{"op": "set", "key": "x"'
+        self.append_bytes(fragment)
+        prefix_end = self.line_end(2)
+        size = self.path.stat().st_size
+        r = s.audit()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (1, 0))
+        self.assertEqual(r["valid_bytes"], prefix_end)
+        self.assertEqual(r["committed_bytes"], prefix_end)
+        self.assertEqual(r["tail_bytes"], len(fragment.encode("utf-8")))
+        self.assertEqual(r["valid_bytes"] + r["tail_bytes"], size)
+
+    def test_tail_fragment_shapes(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        prefix_end = self.line_end(2)
+        fragments = [
+            "{",
+            '{"op": "set"',
+            '{"op": "set", "key": "a", "value": 1.',
+            '{"op": "set", "key": "a", "value": tru',
+            '{"op": "set", "key": "a", "value": "x\\',
+            '{"op": "set", "key": "a", "value": "\\u12',
+            '{"op": "commit", "seq": 2',
+        ]
+        for frag in fragments:
+            self.path.write_bytes(self.path.read_bytes()[:prefix_end])
+            self.append_bytes(frag)
+            size = self.path.stat().st_size
+            r = s.audit()
+            self.assertEqual(r["state"], {"a": 1}, msg=frag)
+            self.assertEqual(r["commit_seq"], 1, msg=frag)
+            self.assertEqual(r["pending_count"], 0, msg=frag)
+            self.assertEqual(r["valid_bytes"], prefix_end, msg=frag)
+            self.assertEqual(
+                r["tail_bytes"], len(frag.encode("utf-8")), msg=frag
+            )
+            self.assertEqual(r["valid_bytes"] + r["tail_bytes"], size, msg=frag)
+
+    def test_unterminated_complete_valid_record_is_tail(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # terminated pending record
+        frag = json.dumps({"op": "set", "key": "x", "value": 9, "seq": 2})
+        self.append_bytes(frag)
+        r = s.audit()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 1)  # terminated record only
+        self.assertEqual(r["valid_bytes"], self.line_end(3))
+        self.assertEqual(r["committed_bytes"], self.line_end(2))
+        self.assertEqual(r["tail_bytes"], len(frag.encode("utf-8")))
+
+    def test_unterminated_complete_commit_fragment_is_tail(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        frag = json.dumps({"op": "commit", "seq": 2})
+        self.append_bytes(frag)
+        r = s.audit()
+        self.assertEqual(r["state"], {"a": 1})  # pending batch not committed
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 1)
+        self.assertEqual(r["valid_bytes"], self.line_end(3))
+        self.assertEqual(r["tail_bytes"], len(frag.encode("utf-8")))
+
+    def test_truncated_utf8_tail_counts_only_as_tail(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        frag = '{"op": "set", "key": "hé'.encode("utf-8")[:-1]
+        self.append_bytes(frag)
+        prefix_end = self.line_end(2)
+        r = s.audit()
+        self.assertEqual((r["state"], r["commit_seq"], r["pending_count"]),
+                         ({"a": 1}, 1, 0))
+        self.assertEqual(r["valid_bytes"], prefix_end)
+        self.assertEqual(r["committed_bytes"], prefix_end)
+        self.assertEqual(r["tail_bytes"], len(frag))
+        # a log holding only truncated UTF-8 bytes audits as fully tail
+        self.path.write_bytes(frag)
+        r2 = WalStore(self.path).audit()
+        self.assertEqual((r2["state"], r2["commit_seq"], r2["pending_count"]),
+                         ({}, 0, 0))
+        self.assertEqual(
+            (r2["valid_bytes"], r2["committed_bytes"], r2["tail_bytes"]),
+            (0, 0, len(frag)),
+        )
+
+    def test_corruption_after_prefix_raises_without_partial_result(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        prefix = self.path.read_bytes()
+        bad_tails = [
+            b"   ",  # trailing whitespace, no terminator
+            b"\n",  # blank line
+            b"  \n",  # blank record
+            b"\xff",  # illegal UTF-8 at end
+            b'{"op": "set", "key": "b", "value": NaN, "seq": 2}\n',
+            b'{"op": "set", "op": "set", "key": "b", "value": 2, "seq": 2}\n',
+            b'{"op": "set", "key": "b", "value": 2, "seq": 5}',  # seq jump
+            b'{"op": "set", "key": "b", "seq": 2}',  # missing field
+            b'{"op": "bogus", "seq": 2}',  # unknown op
+            b"not json\n",
+            b'[1, 2]\n',  # not an object
+            b'{"op": "set", "key": "b", "value": 2, "seq": 2}extra',
+        ]
+        for tail in bad_tails:
+            self.path.write_bytes(prefix)
+            self.append_bytes(tail)
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                s.audit()
+            # memory state untouched after the failed audit
+            self.assertEqual(s.state, {"a": 1}, msg=tail)
+            self.assertEqual(s.commit_seq, 1, msg=tail)
+
+    def test_corruption_anywhere_in_fragment_only_log(self):
+        bad = [
+            b"\xff",
+            b"not json",
+            b'{"op": "set", "key": "a", "value": 1, "seq": 5}',  # seq jump
+            b'{"op": "set", "key": "a", "seq": 1}',
+            b'{"op": "set", "key": "a", "value": 1, "seq": "1"}',
+        ]
+        for data in bad:
+            self.path.write_bytes(data)
+            with self.assertRaises(WalCorruptionError, msg=data):
+                WalStore(self.path).audit()
+
+    def test_audit_does_not_touch_log(self):
+        s = WalStore(self.path)
+        s.set("a", {"n": [1]})
+        s.commit()
+        s.set("tail", 2)
+        fragment = '{"op": "set", "key": "frag"'
+        self.append_bytes(fragment)
+        before = self.path.read_bytes()
+        size = len(before)
+        results = []
+        for _ in range(4):
+            r = s.audit()
+            results.append(dict(r))
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+        self.assertEqual(results[2], results[3])
+
+    def test_audit_does_not_change_memory_state(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # pending, invisible in state
+        self.append_bytes('{"op": "set", "key": "x"')
+        for _ in range(3):
+            s.audit()
+        self.assertEqual(s.state, {"a": 1})
+        self.assertEqual(s.commit_seq, 1)
+        # recover and queries behave exactly as without audit
+        self.assertEqual(s.recover()["pending_count"], 1)
+        self.assertEqual(s.get("a"), 1)
+        self.assertIs(s.contains("b"), False)
+
+    def test_audit_state_is_independent_deep_copy(self):
+        s = WalStore(self.path)
+        s.set("a", {"nested": [1]})
+        s.commit()
+        r = s.audit()
+        r["state"]["a"]["nested"].append(2)
+        r["state"]["z"] = 9
+        self.assertEqual(s.state, {"a": {"nested": [1]}})
+        again = s.audit()
+        self.assertEqual(again["state"], {"a": {"nested": [1]}})
+
+    def test_audit_deterministic_across_reopens(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", 2)
+        s.commit()
+        s.delete("a")
+        self.append_bytes('{"op": "set", "key": "frag", "value":')
+        expected = dict(s.audit())
+        for _ in range(3):
+            reopened = WalStore(self.path)
+            self.assertEqual(dict(reopened.audit()), expected)
+        # attribute access works on the six fields
+        r = s.audit()
+        self.assertEqual(
+            (r.state, r.commit_seq, r.pending_count,
+             r.valid_bytes, r.committed_bytes, r.tail_bytes),
+            (expected["state"], expected["commit_seq"], expected["pending_count"],
+             expected["valid_bytes"], expected["committed_bytes"],
+             expected["tail_bytes"]),
+        )
+
+    def test_audit_then_append_still_drops_fragment(self):
+        # audit must not disturb the cached accepted-prefix boundary that a
+        # later append relies on to discard the tail fragment
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        prefix = self.path.read_bytes()
+        self.append_bytes('{"op": "set", "key": "frag"')
+        s.audit()
+        s.audit()
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        data = self.path.read_bytes()
+        self.assertTrue(data.startswith(prefix))
+        self.assertNotIn(b'"frag"', data)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+        r = s2.audit()
+        self.assertEqual(r["tail_bytes"], 0)
+        self.assertEqual(r["valid_bytes"], len(data))
+        self.assertEqual(r["committed_bytes"], len(data))
+
+    def test_audit_after_clean_appends_reports_full_prefix(self):
+        s = WalStore(self.path)
+        s.audit()  # on a nonexistent log
+        s.set("a", 1)
+        r = s.audit()
+        self.assertEqual(
+            (r["valid_bytes"], r["committed_bytes"], r["tail_bytes"]),
+            (self.path.stat().st_size, 0, 0),
+        )
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (0, 1))
+        s.commit()
+        r = s.audit()
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (1, 0))
+        self.assertEqual(
+            (r["valid_bytes"], r["committed_bytes"], r["tail_bytes"]),
+            (self.path.stat().st_size, self.path.stat().st_size, 0),
+        )
+
+    def test_audit_matches_recover_byte_boundaries_on_legacy_log(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "k", "value": 2, "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        r = s.audit()
+        rec = s.recover()
+        self.assertEqual(r["state"], rec["state"])
+        self.assertEqual(r["commit_seq"], rec["commit_seq"])
+        self.assertEqual(r["pending_count"], rec["pending_count"])
+        self.assertEqual(r["valid_bytes"], self.path.stat().st_size)
+        self.assertEqual(r["committed_bytes"], self.path.stat().st_size)
+        self.assertEqual(r["tail_bytes"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
