@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import os
 from pathlib import Path
 
@@ -23,6 +24,63 @@ _SCHEMAS = {
     "delete": {"op", "key", "seq"},
     "commit": {"op", "seq"},
 }
+
+# bool is an int subclass but remains acceptable (it round-trips as JSON
+# true/false).
+
+
+def _validate_key(key):
+    if not isinstance(key, str):
+        raise ValueError("key must be a string, got %r" % (type(key).__name__,))
+
+
+def _validate_value(root):
+    # Iterative walk: deep nesting must raise ValueError rather than crashing
+    # with RecursionError, and only true back-references (cycles) are rejected
+    # -- containers that merely share a non-cyclic sub-object are allowed.
+    stack = [(root, False)]
+    on_path = set()
+    while stack:
+        value, exiting = stack.pop()
+        if exiting:
+            on_path.discard(id(value))
+            continue
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("float values must be finite, got %r" % (value,))
+            continue
+        if isinstance(value, (str, int)) or value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            obj_id = id(value)
+            if obj_id in on_path:
+                raise ValueError("value contains a circular reference")
+            on_path.add(obj_id)
+            stack.append((value, True))
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    if not isinstance(k, str):
+                        raise ValueError(
+                            "object keys must be strings, got %r"
+                            % (type(k).__name__,)
+                        )
+                    stack.append((v, False))
+            else:
+                for item in value:
+                    stack.append((item, False))
+            continue
+        raise ValueError(
+            "value must be composed of JSON-compatible types, got %r"
+            % (type(value).__name__,)
+        )
+
+
+def _reject_constant(constant):
+    # NaN / Infinity / -Infinity are non-standard JSON constants; a record
+    # containing them is corruption, never silently parsed as a float.
+    raise WalCorruptionError("non-standard JSON constant %r" % (constant,))
 
 
 class WalStore:
@@ -75,11 +133,16 @@ class WalStore:
             os.close(fd)
 
     def set(self, key, value):
+        # Validate fully before touching the log: a rejected call must never
+        # create, truncate, or append to the file or alter in-memory state.
+        _validate_key(key)
+        _validate_value(value)
         self._append(
             {"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1}
         )
 
     def delete(self, key):
+        _validate_key(key)
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
     def commit(self):
@@ -102,7 +165,7 @@ class WalStore:
                 raise WalCorruptionError("log is not valid UTF-8") from exc
             for line in text.splitlines():
                 try:
-                    row = json.loads(line)
+                    row = json.loads(line, parse_constant=_reject_constant)
                 except json.JSONDecodeError as exc:
                     raise WalCorruptionError("invalid JSON record: %r" % line) from exc
                 if not isinstance(row, dict):
@@ -124,6 +187,19 @@ class WalStore:
                     raise WalCorruptionError(
                         "seq %r does not follow committed seq %r" % (seq, committed)
                     )
+                if op != "commit":
+                    # Same strict rules as the write entry point: string keys
+                    # and strict-JSON values only; non-conforming records in
+                    # either the pending tail or the committed region abort the
+                    # whole recovery before the candidate state is adopted.
+                    try:
+                        _validate_key(row["key"])
+                        if op == "set":
+                            _validate_value(row["value"])
+                    except WalCorruptionError:
+                        raise
+                    except ValueError as exc:
+                        raise WalCorruptionError(str(exc)) from exc
                 if op == "commit":
                     # Apply this batch in original set/delete order.
                     for p in pending:
