@@ -84,6 +84,30 @@ def _is_incomplete_record(exc, line):
     return False
 
 
+def _decode_log(data):
+    """Decode log bytes by the recovery UTF-8 rules.
+
+    A write interrupted mid-character leaves a truncated UTF-8 sequence at
+    the very end of the file; only that tail is dropped. Invalid bytes
+    anywhere else are corruption.
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" and exc.end == len(data):
+            return data[: exc.start].decode("utf-8")
+        raise WalCorruptionError("log is not valid UTF-8") from exc
+
+
+def _split_segment(seg):
+    """Split one splitlines() segment into (record_text, terminated)."""
+    if seg.endswith("\r\n"):
+        return seg[:-2], True
+    if seg[-1:] in _LINE_BOUNDARIES:
+        return seg[:-1], True
+    return seg, False
+
+
 def _validate_key(key):
     if not isinstance(key, str):
         raise ValueError("key must be a string, got %r" % (type(key).__name__,))
@@ -308,6 +332,181 @@ class WalStore:
         state, _committed = self._committed_view()
         return key in state
 
+    def snapshot(self, target_seq=None):
+        """Read-only historical view of one successful commit.
+
+        The whole log is parsed and validated by exactly the recovery rules
+        first -- a tail fragment of an interrupted write is discarded, while
+        any other corruption raises WalCorruptionError and no partial
+        snapshot is returned. Only the batches committed at or before
+        target_seq are then replayed: later committed batches and the
+        legal-but-uncommitted records after the last commit never enter the
+        returned state. Nothing is appended, truncated, reordered, or
+        adopted: the live state, commit_seq, and log bytes are untouched.
+
+        target_seq omitted selects the latest commit; 0 yields the empty
+        state. Otherwise it must be a non-boolean, non-negative integer no
+        greater than the latest committed seq, or ValueError is raised.
+        """
+        if target_seq is not None and (
+            not isinstance(target_seq, int)
+            or isinstance(target_seq, bool)
+            or target_seq < 0
+        ):
+            raise ValueError(
+                "target_seq must be a non-negative integer, got %r"
+                % (target_seq,)
+            )
+        # Full validation pass, purely into local objects: corruption here
+        # raises before any target is selected or any state is built. As with
+        # get()/contains(), only the private replay cursor is touched.
+        candidate, committed, _pending, _valid_size, _committed_size = self._replay()
+        if target_seq is None:
+            target_seq = committed
+        elif target_seq > committed:
+            raise ValueError(
+                "target_seq %r is greater than latest commit_seq %r"
+                % (target_seq, committed)
+            )
+        if target_seq == committed:
+            # The validation pass already built exactly this view; it was
+            # never adopted as self.state, so it is safe to return a deep
+            # copy of it.
+            view = candidate
+        elif target_seq == 0:
+            # The state before the first commit is always empty, regardless
+            # of which batches follow it.
+            view = {}
+        else:
+            # Replay a second time -- still read-only -- stopping the moment
+            # the target commit boundary has been applied; every record
+            # beyond it (a later batch or a trailing uncommitted batch) is
+            # left out of the view while having been validated above.
+            view = {}
+            pending = []
+            for row, _seg_len in self._iter_records():
+                op = row["op"]
+                if op == "commit":
+                    for p in pending:
+                        if p["op"] == "delete":
+                            view.pop(p["key"], None)
+                        else:
+                            view[p["key"]] = p["value"]
+                    pending = []
+                    if row["seq"] == target_seq:
+                        break
+                else:
+                    pending.append(row)
+        # An independent deep copy: callers may freely mutate nested values.
+        return RecoveryResult(
+            state=copy.deepcopy(view),
+            commit_seq=target_seq,
+        )
+
+    def _iter_records(self):
+        """Yield every complete, terminated, validated log record in order.
+
+        This applies the full recovery parsing rules exactly once: UTF-8
+        decoding, line segmentation, empty-record rejection, strict JSON
+        (duplicate fields and non-standard constants included), schema and
+        seq validation. A single unfinished write at the very end of the log
+        -- truncated UTF-8, an incomplete JSON prefix, or a complete record
+        whose terminator never became durable -- is skipped silently, as in
+        recovery; anything else raises WalCorruptionError. Each yielded item
+        is (record_dict, segment_byte_length).
+        """
+        if not self.path.exists():
+            return
+        data = self.path.read_bytes()
+        text = _decode_log(data)
+        # splitlines() recognises every Unicode line boundary, while a
+        # literal U+2028/U+2029 inside a JSON string is emitted escaped by
+        # json.dumps, so a legal record can never be fragmented. An empty
+        # file yields no segments at all (empty store). Only the final
+        # segment can lack a terminator, and the terminator is the
+        # boundary that makes a record adoptable: a complete record write
+        # always ends with its newline, so an unterminated final segment
+        # is the unfinished tail of an interrupted write -- even when its
+        # bytes happen to parse as a complete, fully valid record.
+        segments = text.splitlines(keepends=True)
+        last = len(segments) - 1
+        committed = 0
+        for i, seg in enumerate(segments):
+            line, terminated = _split_segment(seg)
+            # Any fragment that remains empty or whitespace-only -- a
+            # blank line between records, a bare empty record, trailing
+            # whitespace, or a second terminator at end of file -- is
+            # corruption and is rejected up front, before any candidate
+            # state can be adopted.
+            if not line.strip():
+                raise WalCorruptionError("empty record in log")
+            try:
+                row = json.loads(
+                    line,
+                    parse_constant=_reject_constant,
+                    object_pairs_hook=_reject_duplicate_keys,
+                )
+            except WalCorruptionError:
+                raise
+            except (json.JSONDecodeError, TypeError) as exc:
+                if (
+                    i == last
+                    and not terminated
+                    and _is_incomplete_record(exc, line)
+                ):
+                    # Interrupted write: the partial trailing record is
+                    # discarded -- it is not replayed, not counted as
+                    # pending, and its bytes stay behind valid_size.
+                    break
+                raise WalCorruptionError("invalid JSON record: %r" % line) from exc
+            if not isinstance(row, dict):
+                raise WalCorruptionError("record is not an object: %r" % (row,))
+            op = row.get("op")
+            if not isinstance(op, str):
+                raise WalCorruptionError("op is not a string: %r" % (op,))
+            schema = _SCHEMAS.get(op)
+            if schema is None:
+                raise WalCorruptionError("unknown op: %r" % (op,))
+            if set(row) != schema:
+                raise WalCorruptionError(
+                    "bad fields for op %r: %r" % (op, sorted(row))
+                )
+            seq = row["seq"]
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
+                raise WalCorruptionError("seq is not a positive integer: %r" % (seq,))
+            if seq != committed + 1:
+                raise WalCorruptionError(
+                    "seq %r does not follow committed seq %r" % (seq, committed)
+                )
+            if op != "commit":
+                # Same strict rules as the write entry point: string keys
+                # and strict-JSON values only; non-conforming records in
+                # either the pending tail or the committed region abort the
+                # whole replay before the candidate state is adopted.
+                try:
+                    _validate_key(row["key"])
+                    if op == "set":
+                        _validate_value(row["value"])
+                except WalCorruptionError:
+                    raise
+                except ValueError as exc:
+                    raise WalCorruptionError(str(exc)) from exc
+            if not terminated:
+                # The record's terminator never became durable, so the
+                # write is unfinished: the fragment is discarded whole --
+                # not applied, not counted as pending, and its bytes stay
+                # beyond valid_size for a later append or rollback to
+                # remove. All validation above has already run, so only a
+                # fragment that is recognisably one complete, valid record
+                # on the seq chain reaches this point; anything else
+                # raised already.
+                break
+            yield row, len(seg.encode("utf-8"))
+            # Advance the validation-only seq counter only for a fully
+            # durable commit record.
+            if op == "commit":
+                committed = seq
+
     def _replay(self):
         candidate = {}
         pending = []
@@ -316,119 +515,24 @@ class WalStore:
         # Byte offset just past the last durable commit record (0 when there
         # is no committed prefix); rollback truncates at exactly this point.
         committed_size = 0
-        if self.path.exists():
-            data = self.path.read_bytes()
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                # A write interrupted mid-character leaves a truncated UTF-8
-                # sequence at the very end of the file; only that tail is
-                # discarded. Invalid bytes anywhere else are corruption.
-                if exc.reason == "unexpected end of data" and exc.end == len(data):
-                    text = data[: exc.start].decode("utf-8")
-                else:
-                    raise WalCorruptionError("log is not valid UTF-8") from exc
-            # splitlines() recognises every Unicode line boundary, while a
-            # literal U+2028/U+2029 inside a JSON string is emitted escaped by
-            # json.dumps, so a legal record can never be fragmented. An empty
-            # file yields no segments at all (empty store). Only the final
-            # segment can lack a terminator, and the terminator is the
-            # boundary that makes a record adoptable: a complete record write
-            # always ends with its newline, so an unterminated final segment
-            # is the unfinished tail of an interrupted write -- even when its
-            # bytes happen to parse as a complete, fully valid record.
-            segments = text.splitlines(keepends=True)
-            last = len(segments) - 1
-            for i, seg in enumerate(segments):
-                if seg.endswith("\r\n"):
-                    line, terminated = seg[:-2], True
-                elif seg[-1:] in _LINE_BOUNDARIES:
-                    line, terminated = seg[:-1], True
-                else:
-                    line, terminated = seg, False
-                # Any fragment that remains empty or whitespace-only -- a
-                # blank line between records, a bare empty record, trailing
-                # whitespace, or a second terminator at end of file -- is
-                # corruption and is rejected up front, before any candidate
-                # state can be adopted.
-                if not line.strip():
-                    raise WalCorruptionError("empty record in log")
-                try:
-                    row = json.loads(
-                        line,
-                        parse_constant=_reject_constant,
-                        object_pairs_hook=_reject_duplicate_keys,
-                    )
-                except WalCorruptionError:
-                    raise
-                except (json.JSONDecodeError, TypeError) as exc:
-                    if (
-                        i == last
-                        and not terminated
-                        and _is_incomplete_record(exc, line)
-                    ):
-                        # Interrupted write: the partial trailing record is
-                        # discarded -- it is not replayed, not counted as
-                        # pending, and its bytes stay behind valid_size.
-                        break
-                    raise WalCorruptionError("invalid JSON record: %r" % line) from exc
-                if not isinstance(row, dict):
-                    raise WalCorruptionError("record is not an object: %r" % (row,))
-                op = row.get("op")
-                if not isinstance(op, str):
-                    raise WalCorruptionError("op is not a string: %r" % (op,))
-                schema = _SCHEMAS.get(op)
-                if schema is None:
-                    raise WalCorruptionError("unknown op: %r" % (op,))
-                if set(row) != schema:
-                    raise WalCorruptionError(
-                        "bad fields for op %r: %r" % (op, sorted(row))
-                    )
-                seq = row["seq"]
-                if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
-                    raise WalCorruptionError("seq is not a positive integer: %r" % (seq,))
-                if seq != committed + 1:
-                    raise WalCorruptionError(
-                        "seq %r does not follow committed seq %r" % (seq, committed)
-                    )
-                if op != "commit":
-                    # Same strict rules as the write entry point: string keys
-                    # and strict-JSON values only; non-conforming records in
-                    # either the pending tail or the committed region abort the
-                    # whole recovery before the candidate state is adopted.
-                    try:
-                        _validate_key(row["key"])
-                        if op == "set":
-                            _validate_value(row["value"])
-                    except WalCorruptionError:
-                        raise
-                    except ValueError as exc:
-                        raise WalCorruptionError(str(exc)) from exc
-                if not terminated:
-                    # The record's terminator never became durable, so the
-                    # write is unfinished: the fragment is discarded whole --
-                    # not applied, not counted as pending, and its bytes stay
-                    # beyond valid_size for a later append or rollback to
-                    # remove. Validation above has already run, so only a
-                    # fragment that is recognisably one complete record
-                    # reaches this point; anything else raised already.
-                    break
-                if op == "commit":
-                    # Apply this batch in original set/delete order.
-                    for p in pending:
-                        if p["op"] == "delete":
-                            candidate.pop(p["key"], None)
-                        else:
-                            candidate[p["key"]] = p["value"]
-                    pending = []
-                    committed = seq
-                else:
-                    pending.append(row)
-                # The segment round-trips to its original bytes, so this is
-                # the exact byte offset just past the record's terminator.
-                valid_size += len(seg.encode("utf-8"))
-                if op == "commit":
-                    committed_size = valid_size
+        for row, seg_len in self._iter_records():
+            op = row["op"]
+            if op == "commit":
+                # Apply this batch in original set/delete order.
+                for p in pending:
+                    if p["op"] == "delete":
+                        candidate.pop(p["key"], None)
+                    else:
+                        candidate[p["key"]] = p["value"]
+                pending = []
+                committed = row["seq"]
+            else:
+                pending.append(row)
+            # The segment round-trips to its original bytes, so this is
+            # the exact byte offset just past the record's terminator.
+            valid_size += seg_len
+            if op == "commit":
+                committed_size = valid_size
         self._valid_size = valid_size
         return candidate, committed, len(pending), valid_size, committed_size
 

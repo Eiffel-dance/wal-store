@@ -746,5 +746,193 @@ class QueryTest(unittest.TestCase):
         self.assertIs(s.contains("other"), False)
 
 
+class SnapshotTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def build_history(self):
+        # seq 1: a=1, b={n:[1]}; seq 2: a removed, c=3; seq 3: empty commit;
+        # then an uncommitted tail (z=9, c deleted).
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()
+        s.commit()
+        s.set("z", 9)
+        s.delete("c")
+        return s
+
+    def test_empty_log_snapshots(self):
+        s = WalStore(self.path)
+        r = s.snapshot()
+        self.assertEqual(dict(r), {"state": {}, "commit_seq": 0})
+        self.assertEqual(set(r.keys()), {"state", "commit_seq"})
+        self.assertEqual((r.state, r.commit_seq), ({}, 0))
+        self.assertEqual(s.snapshot(None), s.snapshot())
+        self.assertEqual(s.snapshot(0), {"state": {}, "commit_seq": 0})
+
+    def test_default_target_is_latest_commit(self):
+        s = self.build_history()
+        r = s.snapshot()
+        self.assertEqual(r["commit_seq"], 3)
+        self.assertEqual(r["state"], {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.snapshot(3), r)
+
+    def test_historical_commits(self):
+        s = self.build_history()
+        self.assertEqual(
+            s.snapshot(1),
+            {"state": {"a": 1, "b": {"n": [1]}}, "commit_seq": 1},
+        )
+        self.assertEqual(
+            s.snapshot(2),
+            {"state": {"b": {"n": [1]}, "c": 3}, "commit_seq": 2},
+        )
+        self.assertEqual(
+            s.snapshot(3),
+            {"state": {"b": {"n": [1]}, "c": 3}, "commit_seq": 3},
+        )
+
+    def test_target_zero_is_empty_even_with_content(self):
+        s = self.build_history()
+        r = s.snapshot(0)
+        self.assertEqual(r["state"], {})
+        self.assertEqual(r["commit_seq"], 0)
+
+    def test_later_and_uncommitted_records_never_appear(self):
+        s = self.build_history()
+        r1 = s.snapshot(1)
+        self.assertNotIn("c", r1["state"])
+        self.assertNotIn("z", r1["state"])
+        self.assertIn("a", r1["state"])
+        # the uncommitted tail never appears at any seq
+        for seq in range(4):
+            self.assertNotIn("z", s.snapshot(seq)["state"])
+
+    def test_repeated_snapshots_are_deterministic(self):
+        s = self.build_history()
+        for seq in range(4):
+            self.assertEqual(s.snapshot(seq), s.snapshot(seq))
+        reopened = WalStore(self.path)
+        for seq in range(4):
+            self.assertEqual(reopened.snapshot(seq), s.snapshot(seq))
+
+    def test_snapshot_state_is_independent_deep_copy(self):
+        s = self.build_history()
+        r1 = s.snapshot(1)
+        r1["state"]["b"]["n"].append(99)
+        r1["state"]["new"] = 1
+        self.assertEqual(
+            s.snapshot(1)["state"], {"a": 1, "b": {"n": [1]}}
+        )
+        r2 = s.snapshot(2)
+        r2["state"]["c"] = 999
+        self.assertEqual(s.snapshot(2)["state"], {"b": {"n": [1]}, "c": 3})
+
+    def test_snapshot_does_not_touch_log_or_live_view(self):
+        s = self.build_history()
+        size = self.log_size()
+        for seq in (None, 0, 1, 2, 3):
+            s.snapshot() if seq is None else s.snapshot(seq)
+        self.assertEqual(self.log_size(), size)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.recover()["pending_count"], 2)
+        # instance can still append and commit on top of the untouched log
+        self.assertEqual(s.commit(), 4)
+        self.assertEqual(self.log_size(), size + len(json.dumps({"op": "commit", "seq": 4}, sort_keys=True)) + 1)
+
+    def test_invalid_target_seq_raises_valueerror(self):
+        s = self.build_history()
+        for bad in (-1, -100, 1.0, 1.5, True, False, "1", b"1", [1], {"x": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.snapshot(bad)
+            # a bad argument is a plain ValueError, never reported as
+            # WalCorruptionError (which is itself a ValueError subclass)
+            self.assertNotIsInstance(_try_raise(s, bad), WalCorruptionError)
+
+    def test_target_above_latest_commit_raises_valueerror(self):
+        s = self.build_history()
+        with self.assertRaises(ValueError):
+            s.snapshot(4)
+        fresh = WalStore(self.path.with_name("empty.wal"))
+        with self.assertRaises(ValueError):
+            fresh.snapshot(1)
+
+    def test_corruption_raises_and_no_partial_snapshot(self):
+        s = self.build_history()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"}\n')  # terminated invalid record
+        for seq in (None, 0, 1, 2):
+            with self.assertRaises(WalCorruptionError):
+                s.snapshot() if seq is None else s.snapshot(seq)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        # read-only: the corrupt record bytes stay exactly where they were
+        self.assertTrue(self.path.read_bytes().endswith(b'{"op": "set", "key": "x"}\n'))
+
+    def test_tail_fragment_does_not_corrupt_snapshot(self):
+        s = self.build_history()
+        size = self.log_size()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "frag"')  # interrupted write
+        self.assertEqual(s.snapshot(2)["state"], {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.snapshot()["commit_seq"], 3)
+        # read-only: the fragment is discarded by replay but left on disk
+        self.assertGreater(self.log_size(), size)
+
+    def test_snapshot_works_after_rollback_and_reopen(self):
+        s = self.build_history()
+        self.assertEqual(s.rollback(), 2)
+        self.assertEqual(
+            s.snapshot(2)["state"], {"b": {"n": [1]}, "c": 3}
+        )
+        self.assertEqual(s.snapshot()["commit_seq"], 3)
+        reopened = WalStore(self.path)
+        self.assertEqual(
+            reopened.snapshot(1)["state"], {"a": 1, "b": {"n": [1]}}
+        )
+
+    def test_legacy_log_serves_snapshots_without_migration(self):
+        self.write_lines(
+            {"op": "set", "key": "legacy", "value": [1, 2], "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "legacy2", "value": 7, "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.snapshot(1), {"state": {"legacy": [1, 2]}, "commit_seq": 1}
+        )
+        self.assertEqual(
+            s.snapshot(2),
+            {"state": {"legacy": [1, 2], "legacy2": 7}, "commit_seq": 2},
+        )
+
+
+def _try_raise(store, target):
+    try:
+        store.snapshot(target)
+    except ValueError as exc:
+        return exc
+    return None
+
+
 if __name__ == "__main__":
     unittest.main()
