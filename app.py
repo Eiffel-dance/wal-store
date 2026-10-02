@@ -348,6 +348,47 @@ class WalStore:
             state = dict(history)[target_seq]
         return RecoveryResult(state=state, commit_seq=target_seq)
 
+    def audit(self):
+        """Read-only audit of the log's byte boundaries and trailing fragment.
+
+        Parses the log under exactly the same UTF-8, JSON, field-set, seq
+        continuity, and record-terminator rules as recover(), but never
+        truncates, rewrites, or appends the log and never replaces the public
+        state or commit_seq; corruption raises WalCorruptionError before any
+        result is returned.
+
+        Returns only:
+          state           -- independent deep copy, identical to recover()'s
+          commit_seq      -- last durable commit seq (identical to recover())
+          pending_count   -- terminated set/delete records past the last commit
+          valid_bytes     -- bytes from the start through the end of the last
+                             terminated, accepted record (committed prefix plus
+                             uncommitted set/delete records)
+          committed_bytes -- byte offset just past the last commit record, 0
+                             when the log holds no commit record
+          tail_bytes      -- file size minus valid_bytes; only the unfinished
+                             trailing write fragment (an incomplete JSON prefix,
+                             one complete valid record lacking its terminator,
+                             or truncated UTF-8 bytes); it is never applied,
+                             counted as pending, or allowed to advance seq
+        """
+        (
+            candidate,
+            committed,
+            pending_count,
+            valid_size,
+            committed_size,
+        ) = self._replay()
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        return RecoveryResult(
+            state=copy.deepcopy(candidate),
+            commit_seq=committed,
+            pending_count=pending_count,
+            valid_bytes=valid_size,
+            committed_bytes=committed_size,
+            tail_bytes=file_size - valid_size,
+        )
+
     def _replay(self, snapshots=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
