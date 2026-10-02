@@ -33,6 +33,56 @@ _SCHEMAS = {
 # default=None, which is an ordinary (and storable) value.
 _UNSET = object()
 
+# Line boundaries recognised by str.splitlines(); a record write always ends
+# with exactly one of them (json.dumps emits the record, then "\n").
+_LINE_BOUNDARIES = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# Proper prefixes of the JSON literals a record value can contain.
+_LITERAL_PREFIXES = ("true", "false", "null")
+
+# Remainders after an already-parsed integer part that can still grow into a
+# valid JSON number when more bytes arrive (e.g. "1." -> "1.5", "1e" -> "1e5").
+_NUMBER_TAILS = frozenset({".", "e", "E", "e+", "e-", "E+", "E-"})
+
+
+def _is_incomplete_record(exc, line):
+    """Whether a JSON parse failure is explained solely by end of input.
+
+    A record whose write was interrupted is a strict prefix of a valid JSON
+    text: the decoder only fails because the bytes stop. Genuine corruption
+    (unrecognised tokens, misplaced characters, trailing data, bad escapes)
+    never qualifies, so it cannot be mistaken for a discardable fragment.
+    """
+    rest = line[exc.pos:]
+    msg = exc.msg
+    if msg == "Unterminated string starting at":
+        # The string scan ran into the end of the input.
+        return True
+    if msg == "Invalid \\uXXXX escape":
+        # A \uXXXX escape cut short by end of input; one containing a non-hex
+        # digit could never come out of a valid write and stays corruption.
+        digits = rest[2:]
+        return len(digits) < 4 and all(c in _HEX_DIGITS for c in digits)
+    if msg == "Expecting value":
+        if not rest:
+            return True
+        if any(lit.startswith(rest) for lit in _LITERAL_PREFIXES):
+            return True
+        # A lone minus sign is the start of a number.
+        return rest == "-"
+    if msg in (
+        "Expecting ',' delimiter",
+        "Expecting ':' delimiter",
+        "Expecting property name enclosed in double quotes",
+    ):
+        if not rest:
+            return True
+        # "1." / "1e" / "1e+" etc.: the decoder stopped inside a number.
+        return msg == "Expecting ',' delimiter" and rest in _NUMBER_TAILS
+    return False
+
 
 def _validate_key(key):
     if not isinstance(key, str):
@@ -107,7 +157,27 @@ class WalStore:
         self.path = Path(path)
         self.state = {}
         self.commit_seq = 0
+        # Byte length of the durable log prefix as judged by the latest
+        # replay; anything beyond it is a discarded tail fragment.
+        self._valid_size = None
         self.recover()
+
+    def _drop_tail_fragment(self):
+        """Remove a discarded tail fragment left by an interrupted write.
+
+        Only bytes beyond the last complete record (as judged by the latest
+        replay) are removed, so a later append can never re-consume the
+        fragment as part of a new record; the durable prefix is never
+        rewritten.
+        """
+        if self._valid_size is None or not self.path.exists():
+            return
+        if self.path.stat().st_size <= self._valid_size:
+            return
+        with self.path.open("r+b") as f:
+            f.truncate(self._valid_size)
+            f.flush()
+            os.fsync(f.fileno())
 
     def _append(self, row):
         """Durably append one log record.
@@ -118,6 +188,7 @@ class WalStore:
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row, sort_keys=True) + "\n"
+        self._drop_tail_fragment()
         created = not self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
             saved_size = f.tell()
@@ -133,6 +204,9 @@ class WalStore:
                 except OSError:
                     pass
                 raise
+            # The appended record is complete and durable, so the durable
+            # prefix now extends to the new end of the file.
+            self._valid_size = f.tell()
         if created:
             self._fsync_parent_dir()
 
@@ -179,7 +253,7 @@ class WalStore:
         # even when newer uncommitted records sit in the tail, and a corrupt
         # record (in the tail or the committed region) raises WalCorruptionError
         # without partially replacing the current in-memory state.
-        candidate, committed, _pending = self._replay()
+        candidate, committed, _pending, _valid_size = self._replay()
         return candidate, committed
 
     def get(self, key, default=_UNSET):
@@ -206,21 +280,40 @@ class WalStore:
         candidate = {}
         pending = []
         committed = 0
+        valid_size = 0
         if self.path.exists():
+            data = self.path.read_bytes()
             try:
-                text = self.path.read_text(encoding="utf-8")
+                text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise WalCorruptionError("log is not valid UTF-8") from exc
+                # A write interrupted mid-character leaves a truncated UTF-8
+                # sequence at the very end of the file; only that tail is
+                # discarded. Invalid bytes anywhere else are corruption.
+                if exc.reason == "unexpected end of data" and exc.end == len(data):
+                    text = data[: exc.start].decode("utf-8")
+                else:
+                    raise WalCorruptionError("log is not valid UTF-8") from exc
             # splitlines() recognises every Unicode line boundary, while a
             # literal U+2028/U+2029 inside a JSON string is emitted escaped by
-            # json.dumps, so a legal record can never be fragmented. It absorbs
-            # the single terminator that ends the final record, and an empty
-            # file yields no lines at all (empty store); any fragment that
-            # remains empty or whitespace-only -- a blank line between records,
-            # a bare empty record, or a second terminator at end of file -- is
-            # therefore corruption and is rejected up front, before any
-            # candidate state can be adopted.
-            for line in text.splitlines():
+            # json.dumps, so a legal record can never be fragmented. An empty
+            # file yields no segments at all (empty store). Only the final
+            # segment can lack a terminator, and only an unterminated final
+            # segment can be the partial record of an interrupted write: a
+            # complete record write always ends with its newline.
+            segments = text.splitlines(keepends=True)
+            last = len(segments) - 1
+            for i, seg in enumerate(segments):
+                if seg.endswith("\r\n"):
+                    line, terminated = seg[:-2], True
+                elif seg[-1:] in _LINE_BOUNDARIES:
+                    line, terminated = seg[:-1], True
+                else:
+                    line, terminated = seg, False
+                # Any fragment that remains empty or whitespace-only -- a
+                # blank line between records, a bare empty record, trailing
+                # whitespace, or a second terminator at end of file -- is
+                # corruption and is rejected up front, before any candidate
+                # state can be adopted.
                 if not line.strip():
                     raise WalCorruptionError("empty record in log")
                 try:
@@ -232,6 +325,15 @@ class WalStore:
                 except WalCorruptionError:
                     raise
                 except (json.JSONDecodeError, TypeError) as exc:
+                    if (
+                        i == last
+                        and not terminated
+                        and _is_incomplete_record(exc, line)
+                    ):
+                        # Interrupted write: the partial trailing record is
+                        # discarded -- it is not replayed, not counted as
+                        # pending, and its bytes stay behind valid_size.
+                        break
                     raise WalCorruptionError("invalid JSON record: %r" % line) from exc
                 if not isinstance(row, dict):
                     raise WalCorruptionError("record is not an object: %r" % (row,))
@@ -276,12 +378,16 @@ class WalStore:
                     committed = seq
                 else:
                     pending.append(row)
-        return candidate, committed, len(pending)
+                # The segment round-trips to its original bytes, so this is
+                # the exact byte offset just past the record's terminator.
+                valid_size += len(seg.encode("utf-8"))
+        self._valid_size = valid_size
+        return candidate, committed, len(pending), valid_size
 
     def recover(self):
         # Replay purely into local objects first; raising WalCorruptionError
         # must never partially replace the current in-memory state.
-        candidate, committed, pending_count = self._replay()
+        candidate, committed, pending_count, _valid_size = self._replay()
         self.state = candidate
         self.commit_seq = committed
         return RecoveryResult(

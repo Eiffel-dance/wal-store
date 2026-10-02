@@ -91,11 +91,134 @@ class RecoverTest(unittest.TestCase):
         s.set("a", 1)
         s.commit()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write('{"op": "set", "key": "x"')  # truncated
+            f.write('{"op": "set", "key": "x"}\n')  # parseable but invalid record
         with self.assertRaises(WalCorruptionError):
             s.recover()
         self.assertEqual(s.state, {"a": 1})
         self.assertEqual(s.commit_seq, 1)
+
+    def test_interrupted_write_tail_is_discarded(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        prefix = self.path.read_bytes()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"')  # interrupted write fragment
+        r = s.recover()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 0)
+        # reopening sees the same committed state, never the fragment
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        # the seq chain continues from the last commit...
+        s2.set("b", 2)
+        self.assertEqual(s2.commit(), 2)
+        s3 = WalStore(self.path)
+        self.assertEqual((s3.state, s3.commit_seq), ({"a": 1, "b": 2}, 2))
+        # ...and the legal prefix bytes were never rewritten
+        self.assertTrue(self.path.read_bytes().startswith(prefix))
+        self.assertNotIn(b'"key": "x"', self.path.read_bytes())
+
+    def test_fragment_only_log_recovers_empty(self):
+        with self.path.open("w", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"')
+        for _ in range(2):
+            s = WalStore(self.path)
+            r = s.recover()
+            self.assertEqual(r["state"], {})
+            self.assertEqual(r["commit_seq"], 0)
+            self.assertEqual(r["pending_count"], 0)
+            self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        # a fresh seq chain starts cleanly on top of the discarded fragment
+        s.set("a", 1)
+        self.assertEqual(s.commit(), 1)
+        self.assertEqual(WalStore(self.path).state, {"a": 1})
+
+    def test_fragment_of_commit_record_does_not_commit(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # complete pending record, seq 2
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "commit", "seq": 2')  # interrupted commit record
+        r = s.recover()
+        self.assertEqual(r["state"], {"a": 1})  # b must not leak into state
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 1)  # only the complete record
+
+    def test_interrupted_write_fragment_shapes(self):
+        fragments = [
+            "{",
+            '{"op": "set"',
+            '{"op": "set", "key": "a", "value": 1.',  # inside a number
+            '{"op": "set", "key": "a", "value": tru',  # inside a literal
+            '{"op": "set", "key": "a", "value": "x\\',  # inside an escape
+            '{"op": "set", "key": "a", "value": "\\u12',  # inside a \uXXXX escape
+        ]
+        for frag in fragments:
+            with self.path.open("w", encoding="utf-8") as f:
+                f.write(frag)
+            s = WalStore(self.path)
+            self.assertEqual((s.state, s.commit_seq), ({}, 0), msg=frag)
+
+    def test_truncated_utf8_tail_is_discarded(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("ab") as f:
+            f.write('{"op": "set", "key": "hé'.encode("utf-8")[:-1])
+        r = s.recover()
+        self.assertEqual((r["state"], r["commit_seq"], r["pending_count"]), ({"a": 1}, 1, 0))
+        # a log holding only truncated UTF-8 bytes recovers empty
+        with self.path.open("wb") as f:
+            f.write('{"op": "set", "key": "hé'.encode("utf-8")[:-1])
+        s2 = WalStore(self.path)
+        r2 = s2.recover()
+        self.assertEqual((r2["state"], r2["commit_seq"], r2["pending_count"]), ({}, 0, 0))
+
+    def test_invalid_utf8_beyond_tail_fragment_is_corruption(self):
+        bad = [
+            b"\xff",  # never a valid UTF-8 byte
+            b"\xe4\x28",  # invalid continuation, not a truncation
+            b'{"op": "commit", "seq": 1}\n\xff',  # invalid byte after a record
+            b'\xff{"op": "commit", "seq": 1}\n',  # invalid byte before a record
+        ]
+        for data in bad:
+            with self.path.open("wb") as f:
+                f.write(data)
+            with self.assertRaises(WalCorruptionError, msg=data):
+                WalStore(self.path)
+
+    def test_invalid_json_at_tail_is_corruption(self):
+        bad_tails = [
+            "not json",
+            '{"op": "set", "key": "x",}',  # trailing comma
+            '{"op": "set", "key": "x"}extra',  # trailing data
+            "[1, 2]",  # not an object
+            '{"op": "set", "key": "\\q"}',  # bad escape
+        ]
+        for tail in bad_tails:
+            with self.path.open("w", encoding="utf-8") as f:
+                f.write(tail)
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                WalStore(self.path)
+
+    def test_trailing_whitespace_and_empty_records_are_corruption(self):
+        self.write_lines({"op": "commit", "seq": 1})
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("   ")  # trailing whitespace, no newline
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        self.write_lines({"op": "commit", "seq": 1}, "")  # blank record line
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_duplicate_field_is_corruption(self):
+        with self.path.open("w", encoding="utf-8") as f:
+            f.write('{"op": "set", "op": "set", "key": "a", "value": 1, "seq": 1}\n')
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
 
     def test_corruption_cases(self):
         bad_logs = [
@@ -293,9 +416,25 @@ class DurabilityTest(unittest.TestCase):
         s.set("a", 1)
         s.commit()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write('{"op": "set", "key": "x"')  # truncated pending record
+            f.write('{"op": "set", "key": "x"}\n')  # invalid record, terminated
         with self.assertRaises(WalCorruptionError):
             WalStore(self.path)
+
+    def test_interrupted_write_then_reopen_continues_seq_chain(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b", "value": 2, "seq": 2')  # interrupted
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s2.recover()["pending_count"], 0)
+        # the next records form a continuous chain from the last commit
+        s2.set("b", 2)
+        self.assertEqual(s2.commit(), 2)
+        s3 = WalStore(self.path)
+        self.assertEqual((s3.state, s3.commit_seq), ({"a": 1, "b": 2}, 2))
+        self.assertEqual(s3.recover()["pending_count"], 0)
 
     def test_corruption_in_committed_region_on_reopen(self):
         self.write_lines(
@@ -483,7 +622,7 @@ class QueryTest(unittest.TestCase):
         s.set("a", 1)
         s.commit()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write('{"op": "set", "key": "x"')  # truncated pending tail
+            f.write('{"op": "set", "key": "x"}\n')  # invalid record, terminated
         with self.assertRaises(WalCorruptionError):
             s.get("a")
         with self.assertRaises(WalCorruptionError):
@@ -491,6 +630,22 @@ class QueryTest(unittest.TestCase):
         # no partial replay replaced the committed in-memory state
         self.assertEqual(s.state, {"a": 1})
         self.assertEqual(s.commit_seq, 1)
+
+    def test_tail_fragment_is_invisible_to_queries(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"')  # interrupted write fragment
+        size = self.log_size()
+        self.assertEqual(s.get("a"), 1)
+        self.assertIs(s.contains("a"), True)
+        self.assertIs(s.contains("x"), False)
+        with self.assertRaises(KeyError):
+            s.get("x")
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # queries never rewrite the log, fragment included
+        self.assertEqual(self.log_size(), size)
 
     def test_non_standard_json_constant_in_log_is_corruption(self):
         s = WalStore(self.path)
