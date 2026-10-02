@@ -127,6 +127,133 @@ class RecoverTest(unittest.TestCase):
             WalStore(self.path)
 
 
+class ValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def test_empty_string_key_is_allowed(self):
+        s = WalStore(self.path)
+        s.set("", 1)
+        s.delete("")
+        s.set("", {"": [""]})
+        self.assertEqual(s.commit(), 1)
+        self.assertEqual(s.state, {"": {"": [""]}})
+
+    def test_non_string_keys_rejected(self):
+        s = WalStore(self.path)
+        for bad_key in (1, 1.5, None, True, b"a", ("a",), ["a"], {"a": 1}):
+            with self.assertRaises(ValueError, msg=bad_key):
+                s.set(bad_key, 1)
+            with self.assertRaises(ValueError, msg=bad_key):
+                s.delete(bad_key)
+        self.assertFalse(self.path.exists())  # log never created
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+
+    def test_non_json_values_rejected(self):
+        s = WalStore(self.path)
+
+        class Custom:
+            pass
+
+        bad_values = [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            {"nested": float("nan")},
+            [1, float("inf")],
+            (1, 2),
+            {"t": (1,)},
+            {1, 2},
+            frozenset([1]),
+            b"bytes",
+            Custom(),
+            {"obj": Custom()},
+            {1: "non-string key"},
+            {"ok": {2: "nested non-string key"}},
+        ]
+        for bad in bad_values:
+            with self.assertRaises(ValueError, msg=bad):
+                s.set("k", bad)
+        self.assertFalse(self.path.exists())
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+
+    def test_circular_reference_rejected(self):
+        s = WalStore(self.path)
+        cyc_list = [1]
+        cyc_list.append(cyc_list)
+        cyc_dict = {}
+        cyc_dict["self"] = cyc_dict
+        for bad in (cyc_list, cyc_dict, {"wrap": cyc_list}):
+            with self.assertRaises(ValueError):
+                s.set("k", bad)
+        self.assertFalse(self.path.exists())
+
+    def test_valid_nested_values_accepted(self):
+        s = WalStore(self.path)
+        value = {"a": [1, 2.5, True, False, None, "x"], "b": {"c": []}}
+        s.set("k", value)
+        s.commit()
+        self.assertEqual(s.state, {"k": value})
+        self.assertEqual(WalStore(self.path).state, {"k": value})
+
+    def test_failed_validation_preserves_prior_state(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.assertRaises(ValueError):
+            s.set("b", float("nan"))
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # log content unchanged: no partial record appended
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s2.recover()["pending_count"], 0)
+
+    def test_recovery_rejects_non_string_key(self):
+        self.write_lines(
+            '{"op": "set", "key": 5, "value": 1, "seq": 1}',
+            '{"op": "commit", "seq": 1}',
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        self.write_lines(
+            '{"op": "delete", "key": null, "seq": 1}',
+            '{"op": "commit", "seq": 1}',
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_recovery_rejects_non_finite_and_bad_constants(self):
+        for line in (
+            '{"op": "set", "key": "a", "value": NaN, "seq": 1}',
+            '{"op": "set", "key": "a", "value": Infinity, "seq": 1}',
+            '{"op": "set", "key": "a", "value": -Infinity, "seq": 1}',
+            '{"op": "set", "key": "a", "value": [1, NaN], "seq": 1}',
+        ):
+            self.write_lines(line, '{"op": "commit", "seq": 1}')
+            with self.assertRaises(WalCorruptionError, msg=line):
+                WalStore(self.path)
+
+    def test_recovery_corruption_does_not_touch_live_state(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b", "value": NaN, "seq": 2}\n')
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+
 class DurabilityTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import os
 from pathlib import Path
 
@@ -23,6 +24,45 @@ _SCHEMAS = {
     "delete": {"op", "key", "seq"},
     "commit": {"op", "seq"},
 }
+
+
+def _validate_key(key, exc_type=ValueError):
+    """Keys must be plain strings; the empty string is allowed."""
+    if not isinstance(key, str):
+        raise exc_type("key must be a string: %r" % (key,))
+
+
+def _validate_json_value(value, exc_type=ValueError, _seen=None):
+    """Only strict JSON values are storable: None, bool, int, finite float,
+    str, and (possibly nested) lists/dicts with string keys. Tuples, sets,
+    custom objects, non-finite floats and circular references are rejected.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise exc_type("float value must be finite: %r" % (value,))
+        return
+    if isinstance(value, (list, dict)):
+        if _seen is None:
+            _seen = set()
+        container_id = id(value)
+        if container_id in _seen:
+            raise exc_type("circular reference in value")
+        _seen.add(container_id)
+        try:
+            if isinstance(value, list):
+                for item in value:
+                    _validate_json_value(item, exc_type, _seen)
+            else:
+                for k, v in value.items():
+                    if not isinstance(k, str):
+                        raise exc_type("object key must be a string: %r" % (k,))
+                    _validate_json_value(v, exc_type, _seen)
+        finally:
+            _seen.discard(container_id)
+        return
+    raise exc_type("value is not a JSON type: %r" % (value,))
 
 
 class WalStore:
@@ -75,11 +115,16 @@ class WalStore:
             os.close(fd)
 
     def set(self, key, value):
+        # Fully validate before touching the log: a rejected call must not
+        # create, truncate or append anything, nor disturb state/commit_seq.
+        _validate_key(key)
+        _validate_json_value(value)
         self._append(
             {"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1}
         )
 
     def delete(self, key):
+        _validate_key(key)
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
     def commit(self):
@@ -124,6 +169,12 @@ class WalStore:
                     raise WalCorruptionError(
                         "seq %r does not follow committed seq %r" % (seq, committed)
                     )
+                if op != "commit":
+                    # Records on disk must obey the same strict JSON rules as
+                    # the write path; any violation rejects the whole log.
+                    _validate_key(row["key"], WalCorruptionError)
+                    if op == "set":
+                        _validate_json_value(row["value"], WalCorruptionError)
                 if op == "commit":
                     # Apply this batch in original set/delete order.
                     for p in pending:
