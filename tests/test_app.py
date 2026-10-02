@@ -91,7 +91,7 @@ class RecoverTest(unittest.TestCase):
         s.set("a", 1)
         s.commit()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write('{"op": "set", "key": "x"')  # truncated
+            f.write('{"op": "set", "key": "x"\n')  # terminated bad record
         with self.assertRaises(WalCorruptionError):
             s.recover()
         self.assertEqual(s.state, {"a": 1})
@@ -293,7 +293,7 @@ class DurabilityTest(unittest.TestCase):
         s.set("a", 1)
         s.commit()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write('{"op": "set", "key": "x"')  # truncated pending record
+            f.write('{"op": "set", "key": "x"\n')  # terminated bad record
         with self.assertRaises(WalCorruptionError):
             WalStore(self.path)
 
@@ -483,7 +483,7 @@ class QueryTest(unittest.TestCase):
         s.set("a", 1)
         s.commit()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write('{"op": "set", "key": "x"')  # truncated pending tail
+            f.write('{"op": "set", "key": "x"\n')  # terminated bad record
         with self.assertRaises(WalCorruptionError):
             s.get("a")
         with self.assertRaises(WalCorruptionError):
@@ -525,6 +525,176 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(s.get("legacy"), [1, 2])
         self.assertIs(s.contains("legacy"), True)
         self.assertIs(s.contains("other"), False)
+
+
+class TornWriteTest(unittest.TestCase):
+    """Recovery after the process dies in the middle of writing one record."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def append_bytes(self, data):
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def test_torn_json_prefix_is_discarded(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b'{"op": "set", "key": "x"')  # interrupted mid-record
+        r = s.recover()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 0)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # recovery is stable: a second pass sees the already-clean log
+        r2 = s.recover()
+        self.assertEqual((r2["commit_seq"], r2["pending_count"]), (1, 0))
+
+    def test_fragment_only_log_recovers_empty(self):
+        self.path.write_bytes(b'{"op": "set", "key": "x", "value": ')
+        s = WalStore(self.path)
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        r = s.recover()
+        self.assertEqual((r["state"], r["commit_seq"], r["pending_count"]), ({}, 0, 0))
+
+    def test_torn_utf8_tail_is_discarded(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        legal = self.path.read_bytes()
+        # interrupted inside the two-byte UTF-8 encoding of "é"
+        self.append_bytes('{"op": "set", "key": "caf'.encode("utf-8") + b"\xc3")
+        r = s.recover()
+        self.assertEqual(r["state"], {"a": 1})
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (1, 0))
+        # only the fragment bytes were removed
+        self.assertEqual(self.path.read_bytes(), legal)
+
+    def test_truncated_utf8_only_fragment_recovers_empty(self):
+        self.path.write_bytes(b"\xc3")
+        s = WalStore(self.path)
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        self.assertEqual(self.path.read_bytes(), b"")
+
+    def test_pending_records_before_fragment_are_counted(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        s.delete("a")
+        self.append_bytes(b'{"op": "set", "key": "x", "value": 1, "seq": ')
+        s2 = WalStore(self.path)
+        r = s2.recover()
+        self.assertEqual((r["state"], r["commit_seq"]), ({"a": 1}, 1))
+        self.assertEqual(r["pending_count"], 2)  # only the complete records
+
+    def test_append_after_recovery_continues_seq_chain(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b'{"op": "set", "key": "x"')
+        s2 = WalStore(self.path)  # discards the fragment
+        s2.set("b", 2)
+        self.assertEqual(s2.commit(), 2)
+        s3 = WalStore(self.path)
+        self.assertEqual((s3.state, s3.commit_seq), ({"a": 1, "b": 2}, 2))
+        # every line in the log is a complete valid record
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            self.assertIn(row["op"], ("set", "delete", "commit"))
+
+    def test_legal_bytes_are_not_modified(self):
+        s = WalStore(self.path)
+        s.set("a", {"n": [1, 2]})
+        s.commit()
+        s.set("b", 2)
+        legal = self.path.read_bytes()
+        self.append_bytes(b'{"op": "set", "key": "x"')
+        WalStore(self.path)
+        self.assertEqual(self.path.read_bytes(), legal)
+
+    def test_queries_apply_the_same_torn_tail_rule(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b'{"op": "set", "key": "x"')
+        self.assertEqual(s.get("a"), 1)
+        self.assertIs(s.contains("a"), True)
+        self.assertIs(s.contains("x"), False)
+
+    def test_every_record_prefix_recovers_cleanly(self):
+        record = json.dumps(
+            {
+                "op": "set",
+                "key": "café",
+                "value": [1, 1.5, "x", None, True, {"k": "v"}],
+                "seq": 2,
+            },
+            sort_keys=True,
+        )
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        base = self.path.read_bytes()
+        full = record.encode("utf-8")
+        for i in range(1, len(full)):
+            self.path.write_bytes(base + full[:i])
+            try:
+                r = WalStore(self.path).recover()
+            except WalCorruptionError:
+                self.fail("byte prefix %d raised WalCorruptionError" % i)
+            self.assertEqual(r["state"], {"a": 1})
+            self.assertEqual((r["commit_seq"], r["pending_count"]), (1, 0))
+        # the complete record without a newline stays legal and pending
+        self.path.write_bytes(base + full)
+        r = WalStore(self.path).recover()
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (1, 1))
+
+    def test_newline_terminated_bad_record_is_still_corruption(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b'{"op": "set", "key": "x"\n')  # terminated => not torn
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+    def test_parseable_but_invalid_final_record_is_still_corruption(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b'{"op": "set", "key": "x"}')  # complete JSON, bad fields
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+
+    def test_blank_tail_is_still_corruption(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b"   ")
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+        self.append_bytes(b"\n")
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+
+    def test_invalid_utf8_away_from_tail_is_corruption(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        # 0xff is not a truncation of any valid character
+        self.append_bytes(b"\xff")
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+        # invalid byte followed by more content: corruption, never a fragment
+        self.path.write_bytes(b'{"op": "commit", "seq": 2}\n\xff\n')
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
 
 
 if __name__ == "__main__":

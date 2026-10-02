@@ -88,6 +88,194 @@ def _reject_constant(constant):
     raise WalCorruptionError("non-standard JSON constant %r" % (constant,))
 
 
+# Characters str.splitlines() treats as line boundaries. json.dumps escapes
+# every control character inside strings, so a legal record never contains
+# any of these raw; the final record is terminated exactly when the log text
+# ends with one of them.
+_LINE_BOUNDARY_CHARS = frozenset("\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+_LITERALS = {"t": "true", "f": "false", "n": "null"}
+
+
+def _scan_json_string(text, i):
+    """Scan a JSON string token starting at text[i] == '"'.
+
+    Returns (status, next_index): "complete" when the closing quote was
+    found, "prefix" when the input ended inside the token, and "invalid"
+    when the token violates the JSON grammar.
+    """
+    n = len(text)
+    j = i + 1
+    while True:
+        if j >= n:
+            return "prefix", j
+        c = text[j]
+        if c == '"':
+            return "complete", j + 1
+        if c == "\\":
+            j += 1
+            if j >= n:
+                return "prefix", j
+            esc = text[j]
+            if esc in '"\\/bfnrt':
+                j += 1
+            elif esc == "u":
+                j += 1
+                for _ in range(4):
+                    if j >= n:
+                        return "prefix", j
+                    if text[j] not in _HEX_DIGITS:
+                        return "invalid", i
+                    j += 1
+            else:
+                return "invalid", i
+        elif ord(c) < 0x20:
+            # Control characters must be escaped; json.loads agrees.
+            return "invalid", i
+        else:
+            j += 1
+
+
+def _scan_json_number(text, i):
+    """Scan a JSON number token starting at text[i]; same protocol as
+    _scan_json_string."""
+    n = len(text)
+    j = i
+    if j < n and text[j] == "-":
+        j += 1
+    if j >= n:
+        return "prefix", j
+    if text[j] == "0":
+        j += 1
+    elif "1" <= text[j] <= "9":
+        while j < n and "0" <= text[j] <= "9":
+            j += 1
+    else:
+        return "invalid", i
+    if j < n and text[j] == ".":
+        j += 1
+        if j >= n:
+            return "prefix", j
+        if not "0" <= text[j] <= "9":
+            return "invalid", i
+        while j < n and "0" <= text[j] <= "9":
+            j += 1
+    if j < n and text[j] in "eE":
+        j += 1
+        if j < n and text[j] in "+-":
+            j += 1
+        if j >= n:
+            return "prefix", j
+        if not "0" <= text[j] <= "9":
+            return "invalid", i
+        while j < n and "0" <= text[j] <= "9":
+            j += 1
+    return "complete", j
+
+
+def _json_prefix_status(text):
+    """Classify text against the JSON grammar without building a value.
+
+    Returns "complete" when text is exactly one valid JSON document
+    (surrounding whitespace allowed), "prefix" when it is a strict prefix
+    of some valid JSON document -- more bytes could still complete it --
+    and "invalid" otherwise. Only "prefix" fragments can be the torn tail
+    of an interrupted write. Iterative, so deeply nested fragments cannot
+    hit the recursion limit.
+    """
+    n = len(text)
+    i = 0
+    stack = []  # state to enter once the nested value being parsed completes
+    state = "value"
+    while True:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            # Ran out of input: a finished top-level value means the text
+            # was complete; anything else is a truncated prefix.
+            return "complete" if state == "end" else "prefix"
+        c = text[i]
+        if state == "value":
+            if c == "{":
+                stack.append("obj_after_value")
+                state = "obj_key_or_end"
+                i += 1
+            elif c == "[":
+                stack.append("arr_after_value")
+                state = "arr_value_or_end"
+                i += 1
+            elif c == '"':
+                status, i = _scan_json_string(text, i)
+                if status != "complete":
+                    return status
+                state = stack[-1] if stack else "end"
+            elif c in _LITERALS:
+                word = _LITERALS[c]
+                rest = text[i:i + len(word)]
+                if rest == word:
+                    i += len(word)
+                    state = stack[-1] if stack else "end"
+                elif word.startswith(rest):
+                    return "prefix"
+                else:
+                    return "invalid"
+            elif c == "-" or "0" <= c <= "9":
+                status, i = _scan_json_number(text, i)
+                if status != "complete":
+                    return status
+                state = stack[-1] if stack else "end"
+            else:
+                return "invalid"
+        elif state == "arr_value_or_end":
+            if c == "]":
+                stack.pop()
+                i += 1
+                state = stack[-1] if stack else "end"
+            else:
+                state = "value"
+        elif state == "obj_key_or_end" or state == "obj_key":
+            if state == "obj_key_or_end" and c == "}":
+                stack.pop()
+                i += 1
+                state = stack[-1] if stack else "end"
+            elif c == '"':
+                status, i = _scan_json_string(text, i)
+                if status != "complete":
+                    return status
+                state = "obj_colon"
+            else:
+                return "invalid"
+        elif state == "obj_colon":
+            if c != ":":
+                return "invalid"
+            i += 1
+            state = "value"
+        elif state == "obj_after_value":
+            if c == "}":
+                stack.pop()
+                i += 1
+                state = stack[-1] if stack else "end"
+            elif c == ",":
+                i += 1
+                state = "obj_key"
+            else:
+                return "invalid"
+        elif state == "arr_after_value":
+            if c == "]":
+                stack.pop()
+                i += 1
+                state = stack[-1] if stack else "end"
+            elif c == ",":
+                i += 1
+                state = "value"
+            else:
+                return "invalid"
+        else:  # "end": a complete document followed by more content
+            return "invalid"
+
+
 def _reject_duplicate_keys(pairs):
     # A JSON object with repeated member names is corruption even when the
     # repeated values are identical; the default last-wins behaviour would
@@ -179,7 +367,7 @@ class WalStore:
         # even when newer uncommitted records sit in the tail, and a corrupt
         # record (in the tail or the committed region) raises WalCorruptionError
         # without partially replacing the current in-memory state.
-        candidate, committed, _pending = self._replay()
+        candidate, committed, _pending, _torn = self._replay()
         return candidate, committed
 
     def get(self, key, default=_UNSET):
@@ -206,11 +394,23 @@ class WalStore:
         candidate = {}
         pending = []
         committed = 0
+        torn_bytes = 0
         if self.path.exists():
+            data = self.path.read_bytes()
+            tail = b""
             try:
-                text = self.path.read_text(encoding="utf-8")
+                text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
-                raise WalCorruptionError("log is not valid UTF-8") from exc
+                # A write interrupted mid-character leaves a truncated
+                # multi-byte sequence at the very end of the file; those
+                # bytes belong to the torn fragment. Invalid UTF-8 anywhere
+                # else -- or any trailing byte sequence that is not a
+                # truncation of a valid character -- is corruption.
+                if exc.end == len(data) and exc.reason == "unexpected end of data":
+                    tail = data[exc.start:]
+                    text = data[:exc.start].decode("utf-8")
+                else:
+                    raise WalCorruptionError("log is not valid UTF-8") from exc
             # splitlines() recognises every Unicode line boundary, while a
             # literal U+2028/U+2029 inside a JSON string is emitted escaped by
             # json.dumps, so a legal record can never be fragmented. It absorbs
@@ -220,7 +420,22 @@ class WalStore:
             # a bare empty record, or a second terminator at end of file -- is
             # therefore corruption and is rejected up front, before any
             # candidate state can be adopted.
-            for line in text.splitlines():
+            lines = text.splitlines()
+            torn_bytes = len(tail)
+            if lines and text[-1] not in _LINE_BOUNDARY_CHARS:
+                # The final record is unterminated. A complete record stays
+                # readable without its newline; a fragment left by an
+                # interrupted write -- valid JSON so far, missing the rest
+                # only because the input ended -- is discarded: it is not
+                # replayed, not counted as pending, and does not advance the
+                # seq. Anything else (a blank fragment, broken JSON, or a
+                # parseable record with illegal fields or seq) remains
+                # corruption and is rejected by the loop below.
+                last = lines[-1]
+                if last.strip() and _json_prefix_status(last) == "prefix":
+                    torn_bytes += len(last.encode("utf-8"))
+                    lines = lines[:-1]
+            for line in lines:
                 if not line.strip():
                     raise WalCorruptionError("empty record in log")
                 try:
@@ -276,12 +491,31 @@ class WalStore:
                     committed = seq
                 else:
                     pending.append(row)
-        return candidate, committed, len(pending)
+        return candidate, committed, len(pending), torn_bytes
+
+    def _truncate_tail(self, nbytes):
+        """Remove a torn fragment left by an interrupted write.
+
+        Only ever shortens the log: every byte of the legal prefix is left
+        untouched, so a later append extends the last complete record
+        instead of merging with the fragment and re-consuming it.
+        """
+        with self.path.open("r+b") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.truncate(max(size - nbytes, 0))
+            f.flush()
+            os.fsync(f.fileno())
 
     def recover(self):
         # Replay purely into local objects first; raising WalCorruptionError
         # must never partially replace the current in-memory state.
-        candidate, committed, pending_count = self._replay()
+        candidate, committed, pending_count, torn_bytes = self._replay()
+        if torn_bytes:
+            # The discarded fragment is dropped physically as well: once
+            # replay has classified it, removing exactly those bytes keeps a
+            # later append from extending the fragment into a corrupt record.
+            self._truncate_tail(torn_bytes)
         self.state = candidate
         self.commit_seq = committed
         return RecoveryResult(
