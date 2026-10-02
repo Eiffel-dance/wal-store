@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 
 
@@ -32,9 +33,30 @@ class WalStore:
         self.recover()
 
     def _append(self, row):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        """Write one record and force it to stable storage before returning.
+
+        Any failure from the underlying write/fsync propagates as OSError;
+        the caller is left untouched so a failed write never consumes a
+        sequence number or fabricates committed state.
+        """
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, sort_keys=True) + "\n"
+        existed = self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, sort_keys=True) + "\n")
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        if not existed:
+            # Persist the directory entry itself for a freshly created log.
+            try:
+                dir_fd = os.open(os.fspath(parent), os.O_RDONLY)
+            except OSError:
+                return
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def set(self, key, value):
         self._append({"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1})
@@ -43,8 +65,12 @@ class WalStore:
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
     def commit(self):
-        self.commit_seq += 1
-        self._append({"op": "commit", "seq": self.commit_seq})
+        next_seq = self.commit_seq + 1
+        # The durable commit record is the only thing that advances the
+        # boundary; if the write cannot complete, _append raises OSError
+        # before any in-memory state changes.
+        self._append({"op": "commit", "seq": next_seq})
+        self.commit_seq = next_seq
         self.recover()
         return self.commit_seq
 
