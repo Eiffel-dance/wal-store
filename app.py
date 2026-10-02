@@ -247,13 +247,45 @@ class WalStore:
         self.recover()
         return self.commit_seq
 
+    def rollback(self):
+        # Validate the log by the exact recovery rules before touching
+        # anything. The replay builds only local objects, so corruption raises
+        # WalCorruptionError without partially replacing state or commit_seq.
+        # committed_size is the byte offset just past the last commit record;
+        # every complete set/delete beyond it is the uncommitted batch, and any
+        # bytes beyond valid_size are the discardable interrupted-write tail.
+        (
+            _candidate,
+            _committed,
+            pending_count,
+            _valid_size,
+            committed_size,
+        ) = self._replay()
+        if not self.path.exists() or self.path.stat().st_size <= committed_size:
+            # Nothing sits beyond the committed prefix (pending_count is then
+            # necessarily 0); no truncation is needed.
+            self._valid_size = committed_size
+            return pending_count
+        # Shrink the log in place: bytes of the committed prefix are never
+        # rewritten or reordered, only the tail beyond the last commit is
+        # removed. Persist before returning, and let an OSError from open,
+        # truncate, flush, or fsync propagate -- a failed truncation must
+        # never masquerade as a successful rollback. state and commit_seq are
+        # not touched: they already equal the last committed view.
+        with self.path.open("r+b") as f:
+            f.truncate(committed_size)
+            f.flush()
+            os.fsync(f.fileno())
+        self._valid_size = committed_size
+        return pending_count
+
     def _committed_view(self):
         # Replay the log purely into local objects, exactly like recovery, but
         # never adopt the result: a query must observe the last durable commit
         # even when newer uncommitted records sit in the tail, and a corrupt
         # record (in the tail or the committed region) raises WalCorruptionError
         # without partially replacing the current in-memory state.
-        candidate, committed, _pending, _valid_size = self._replay()
+        candidate, committed, _pending, _valid_size, _committed_size = self._replay()
         return candidate, committed
 
     def get(self, key, default=_UNSET):
@@ -281,6 +313,9 @@ class WalStore:
         pending = []
         committed = 0
         valid_size = 0
+        # Byte offset just past the last durable commit record (0 when there
+        # is no committed prefix); rollback truncates at exactly this point.
+        committed_size = 0
         if self.path.exists():
             data = self.path.read_bytes()
             try:
@@ -381,13 +416,15 @@ class WalStore:
                 # The segment round-trips to its original bytes, so this is
                 # the exact byte offset just past the record's terminator.
                 valid_size += len(seg.encode("utf-8"))
+                if op == "commit":
+                    committed_size = valid_size
         self._valid_size = valid_size
-        return candidate, committed, len(pending), valid_size
+        return candidate, committed, len(pending), valid_size, committed_size
 
     def recover(self):
         # Replay purely into local objects first; raising WalCorruptionError
         # must never partially replace the current in-memory state.
-        candidate, committed, pending_count, _valid_size = self._replay()
+        candidate, committed, pending_count, _valid_size, _committed_size = self._replay()
         self.state = candidate
         self.commit_seq = committed
         return RecoveryResult(
