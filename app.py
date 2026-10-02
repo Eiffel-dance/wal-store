@@ -332,9 +332,12 @@ class WalStore:
             # literal U+2028/U+2029 inside a JSON string is emitted escaped by
             # json.dumps, so a legal record can never be fragmented. An empty
             # file yields no segments at all (empty store). Only the final
-            # segment can lack a terminator, and only an unterminated final
-            # segment can be the partial record of an interrupted write: a
-            # complete record write always ends with its newline.
+            # segment can lack a terminator, and the record terminator is the
+            # boundary that makes a record adoptable: an unterminated final
+            # segment is the tail of an interrupted write -- whether its bytes
+            # are a truncated prefix of a record or a complete record whose
+            # terminating newline never arrived -- and is discarded either
+            # way. A finished record write always ends with its newline.
             segments = text.splitlines(keepends=True)
             last = len(segments) - 1
             for i, seg in enumerate(segments):
@@ -402,6 +405,18 @@ class WalStore:
                         raise
                     except ValueError as exc:
                         raise WalCorruptionError(str(exc)) from exc
+                if i == last and not terminated:
+                    # The bytes form a complete, fully valid record, but the
+                    # write never finished: the record terminator that makes a
+                    # record adoptable never reached the log. Treat the whole
+                    # fragment as an interrupted tail write and discard it --
+                    # it must not change state, commit_seq, or pending_count,
+                    # and its bytes stay beyond valid_size so a later append
+                    # or rollback removes them instead of splicing them into a
+                    # new record. (A fragment that is JSON-parseable but fails
+                    # record/field/seq/value validation never gets here: the
+                    # checks above already raised WalCorruptionError.)
+                    break
                 if op == "commit":
                     # Apply this batch in original set/delete order.
                     for p in pending:

@@ -80,11 +80,97 @@ class RecoverTest(unittest.TestCase):
         self.assertEqual(s.recover()["state"], {"a": {"nested": [1]}})
 
     def test_last_line_without_newline(self):
+        # A complete record whose terminating newline never arrived is an
+        # interrupted write: the terminator is the adoption boundary, so the
+        # commit is discarded even though its bytes parse and validate.
         self.write_lines({"op": "set", "key": "a", "value": 1, "seq": 1})
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"op": "commit", "seq": 1}))
         s = WalStore(self.path)
-        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        r = s.recover()
+        self.assertEqual(r["pending_count"], 1)  # only the terminated set
+        # constructor, recover, and read-only queries agree on the same rule
+        self.assertIs(s.contains("a"), False)
+        with self.assertRaises(KeyError):
+            s.get("a")
+
+    def test_unterminated_complete_record_is_discarded_then_chain_continues(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        prefix = self.path.read_bytes()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "set", "key": "x", "value": 9, "seq": 2}))
+        r = s.recover()
+        # the unterminated record is invisible: no state, no seq, no pending
+        self.assertEqual((r["state"], r["commit_seq"], r["pending_count"]), ({"a": 1}, 1, 0))
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertIs(s2.contains("x"), False)
+        # appending drops the fragment bytes and continues the original chain
+        s2.set("b", 2)
+        self.assertEqual(s2.commit(), 2)
+        s3 = WalStore(self.path)
+        self.assertEqual((s3.state, s3.commit_seq), ({"a": 1, "b": 2}, 2))
+        data = self.path.read_bytes()
+        self.assertTrue(data.startswith(prefix))
+        self.assertNotIn(b'"key": "x"', data)
+
+    def test_unterminated_complete_commit_does_not_advance_seq(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # terminated pending record, seq 2
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "commit", "seq": 2}))  # no newline
+        r = s.recover()
+        self.assertEqual(r["state"], {"a": 1})  # b must not leak into state
+        self.assertEqual(r["commit_seq"], 1)
+        self.assertEqual(r["pending_count"], 1)  # only the terminated record
+        # rollback removes the discarded fragment along with the pending tail
+        self.assertEqual(s.rollback(), 1)
+        s.set("c", 3)
+        self.assertEqual(s.commit(), 2)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "c": 3}, 2))
+        self.assertNotIn(b'"key": "b"', self.path.read_bytes())
+
+    def test_unterminated_complete_set_is_not_pending(self):
+        self.write_lines({"op": "commit", "seq": 1})
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "set", "key": "a", "value": 1, "seq": 2}))
+        for _ in range(2):
+            s = WalStore(self.path)
+            r = s.recover()
+            self.assertEqual((r["state"], r["commit_seq"], r["pending_count"]), ({}, 1, 0))
+            self.assertEqual((s.state, s.commit_seq), ({}, 1))
+
+    def test_unterminated_invalid_record_is_corruption(self):
+        bad_tails = [
+            json.dumps({"op": "set", "key": "a", "value": 1, "seq": 5}),  # seq jump
+            json.dumps({"op": "set", "key": "a", "seq": 1}),  # missing value
+            json.dumps({"op": "bogus", "seq": 1}),  # unknown op
+            json.dumps({"op": "commit", "seq": 1, "extra": 1}),  # extra field
+            json.dumps({"op": "set", "key": "a", "value": 1, "seq": True}),  # bool seq
+            '{"op": "set", "key": "a", "value": NaN, "seq": 1}',  # non-standard constant
+        ]
+        for tail in bad_tails:
+            with self.path.open("w", encoding="utf-8") as f:
+                f.write(tail)  # complete-looking but invalid, no terminator
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                WalStore(self.path)
+
+    def test_unterminated_fragment_never_partially_updates_memory(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "commit", "seq": 5}))  # seq jump, unterminated
+        for op in (s.recover, lambda: s.get("a"), lambda: s.contains("a")):
+            with self.assertRaises(WalCorruptionError):
+                op()
+            self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
 
     def test_corruption_raises_and_preserves_memory(self):
         s = WalStore(self.path)
