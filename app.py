@@ -25,6 +25,9 @@ _SCHEMAS = {
     "commit": {"op", "seq"},
 }
 
+# Distinguishes "no default given" from an explicit default of None in get().
+_UNSET = object()
+
 # bool is an int subclass but remains acceptable (it round-trips as JSON
 # true/false).
 
@@ -144,6 +147,40 @@ class WalStore:
     def delete(self, key):
         _validate_key(key)
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
+
+    def _replay_committed(self):
+        # Observation-only replay for the read-only queries: runs the same
+        # strict whole-log validation as recover(), so structural, seq, or
+        # JSON-value errors surface as WalCorruptionError during a query. The
+        # replayed candidate is never adopted here -- a failed (or successful)
+        # query can therefore never replace the live in-memory state, advance
+        # commit_seq, or append a record.
+        candidate, _committed, _pending = self._replay()
+        return candidate
+
+    def get(self, key, default=_UNSET):
+        # Queries observe only the last committed state: pending set/delete
+        # records live solely in the log tail and are excluded by the replay.
+        _validate_key(key)
+        state = self._replay_committed()
+        try:
+            value = state[key]
+        except KeyError:
+            if default is _UNSET:
+                raise
+            # The default is caller-supplied data handed straight back; hold
+            # it to the same JSON-value contract as set() (only once it is
+            # actually used, mirroring dict.get), then isolate it.
+            _validate_value(default)
+            return copy.deepcopy(default)
+        # A committed None is a real value and is never confused with a
+        # missing key. Return an independent deep copy so callers cannot mutate
+        # committed state, later queries, or the state seen after reopening.
+        return copy.deepcopy(value)
+
+    def contains(self, key):
+        _validate_key(key)
+        return key in self._replay_committed()
 
     def commit(self):
         # Persist the commit boundary first and only adopt the new seq/state

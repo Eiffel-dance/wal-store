@@ -345,5 +345,199 @@ class DurabilityTest(unittest.TestCase):
         self.assertEqual(r0["pending_count"], 1)
 
 
+class QueryTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def test_empty_log(self):
+        s = WalStore(self.path)
+        with self.assertRaises(KeyError):
+            s.get("a")
+        self.assertIs(s.contains("a"), False)
+
+    def test_get_returns_committed_value(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.assertEqual(s.get("a"), 1)
+        self.assertIs(s.contains("a"), True)
+
+    def test_get_stored_none_is_not_missing(self):
+        s = WalStore(self.path)
+        s.set("a", None)
+        s.commit()
+        self.assertIsNone(s.get("a"))  # present None, not KeyError
+        self.assertIs(s.contains("a"), True)
+        # missing key without default still raises
+        with self.assertRaises(KeyError):
+            s.get("missing")
+        self.assertIs(s.contains("missing"), False)
+
+    def test_get_default_is_returned_for_missing_key(self):
+        s = WalStore(self.path)
+        self.assertEqual(s.get("missing", 7), 7)
+        self.assertIsNone(s.get("missing", None))
+        # default is not used (or validated) when the key exists
+        self.assertEqual(s.get("missing", {"x": 1}), {"x": 1})
+
+    def test_committed_none_shadows_default(self):
+        s = WalStore(self.path)
+        s.set("a", None)
+        s.commit()
+        sentinel = object()
+        self.assertIsNone(s.get("a", sentinel))
+
+    def test_uncommitted_writes_are_invisible(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("a", 2)       # uncommitted overwrite
+        s.set("b", 3)       # uncommitted new key
+        s.delete("a")       # uncommitted delete
+        self.assertEqual(s.get("a"), 1)            # still the committed value
+        self.assertIs(s.contains("a"), True)       # not deleted yet
+        with self.assertRaises(KeyError):
+            s.get("b")                            # uncommitted set invisible
+        self.assertIs(s.contains("b"), False)
+
+    def test_deep_copy_is_independent_of_state(self):
+        s = WalStore(self.path)
+        s.set("a", {"nested": [1, {"k": 2}]})
+        s.commit()
+        got = s.get("a")
+        got["nested"].append(99)
+        got["nested"][1]["k"] = "x"
+        # in-memory state untouched
+        self.assertEqual(s.state, {"a": {"nested": [1, {"k": 2}]}})
+        # a later query and a reopen see the original committed value
+        self.assertEqual(s.get("a"), {"nested": [1, {"k": 2}]})
+        self.assertEqual(WalStore(self.path).get("a"), {"nested": [1, {"k": 2}]})
+
+    def test_returned_values_are_independent_across_calls(self):
+        s = WalStore(self.path)
+        s.set("a", [1])
+        s.commit()
+        first = s.get("a")
+        second = s.get("a")
+        self.assertIsNot(first, second)
+        first.append(2)
+        self.assertEqual(second, [1])
+
+    def test_default_is_an_independent_copy(self):
+        s = WalStore(self.path)
+        default = {"n": [1]}
+        got = s.get("missing", default)
+        got["n"].append(2)
+        self.assertEqual(default, {"n": [1]})       # caller's object untouched
+        self.assertEqual(s.get("missing", default), {"n": [1]})
+
+    def test_non_string_key_raises_value_error(self):
+        s = WalStore(self.path)
+        for bad in (1, 1.5, None, b"a", ["a"], {"a"}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.get(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                s.contains(bad)
+
+    def test_invalid_default_raises_value_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        # an invalid default is not validated while the key exists
+        self.assertEqual(s.get("a", object()), 1)
+        for bad in (object(), float("nan"), {1: 2}, {"k": float("inf")}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.get("missing", bad)
+
+    def test_queries_have_no_side_effects(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        before = self.path.read_bytes()
+        s.get("a")
+        s.get("missing", 3)
+        s.contains("a")
+        s.contains("missing")
+        self.assertEqual(self.path.read_bytes(), before)  # no log appended
+        self.assertEqual(s.commit_seq, 1)
+        self.assertEqual(s.recover()["pending_count"], 1)  # pending untouched
+
+    def test_scalar_array_object_values_round_trip(self):
+        s = WalStore(self.path)
+        values = {"str": "x", "int": 5, "float": 1.5, "bool": True,
+                  "none": None, "arr": [1, 2, {"q": [3]}], "obj": {"k": [True]}}
+        for k, v in values.items():
+            s.set(k, v)
+        s.commit()
+        for k, v in values.items():
+            self.assertEqual(s.get(k), v)
+            self.assertIs(s.contains(k), True)
+
+    def test_query_raises_corruption_and_keeps_memory(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"')  # truncated tail record
+        with self.assertRaises(WalCorruptionError):
+            s.get("a")
+        with self.assertRaises(WalCorruptionError):
+            s.contains("a")
+        # observation-only replay never replaced the live state
+        self.assertEqual(s.state, {"a": 1})
+        self.assertEqual(s.commit_seq, 1)
+
+    def test_query_corruption_in_committed_region_on_reopen(self):
+        # A healthy live instance, then its log gains a stale-seq tail record
+        # (the same corruption the constructor rejects on reopen): the query
+        # must surface it as WalCorruptionError without touching live state.
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"op": "set", "key": "b", "value": 2, "seq": 1}
+            ) + "\n")  # expected seq 2 after committed seq 1
+        with self.assertRaises(WalCorruptionError):
+            s.get("a")
+        with self.assertRaises(WalCorruptionError):
+            s.contains("a")
+        self.assertEqual(s.state, {"a": 1})
+        self.assertEqual(s.commit_seq, 1)
+
+    def test_query_after_delete_and_recommit(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", 2)
+        s.commit()
+        s.delete("a")
+        s.commit()
+        with self.assertRaises(KeyError):
+            s.get("a")
+        self.assertIs(s.contains("a"), False)
+        self.assertEqual(s.get("a", "d"), "d")
+        self.assertEqual(s.get("b"), 2)
+
+    def test_deleting_absent_key_then_commit_keeps_queries_valid(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.delete("never")
+        s.commit()
+        self.assertEqual(s.get("a"), 1)
+        self.assertIs(s.contains("never"), False)
+
+
 if __name__ == "__main__":
     unittest.main()
