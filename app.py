@@ -253,7 +253,7 @@ class WalStore:
         # even when newer uncommitted records sit in the tail, and a corrupt
         # record (in the tail or the committed region) raises WalCorruptionError
         # without partially replacing the current in-memory state.
-        candidate, committed, _pending, _valid_size = self._replay()
+        candidate, committed, _pending, _valid_size, _committed_size = self._replay()
         return candidate, committed
 
     def get(self, key, default=_UNSET):
@@ -281,6 +281,10 @@ class WalStore:
         pending = []
         committed = 0
         valid_size = 0
+        # Byte offset just past the last commit record; everything beyond it
+        # (complete uncommitted records and any discarded tail fragment) is
+        # exactly what rollback removes.
+        committed_size = 0
         if self.path.exists():
             data = self.path.read_bytes()
             try:
@@ -381,13 +385,15 @@ class WalStore:
                 # The segment round-trips to its original bytes, so this is
                 # the exact byte offset just past the record's terminator.
                 valid_size += len(seg.encode("utf-8"))
+                if op == "commit":
+                    committed_size = valid_size
         self._valid_size = valid_size
-        return candidate, committed, len(pending), valid_size
+        return candidate, committed, len(pending), valid_size, committed_size
 
     def recover(self):
         # Replay purely into local objects first; raising WalCorruptionError
         # must never partially replace the current in-memory state.
-        candidate, committed, pending_count, _valid_size = self._replay()
+        candidate, committed, pending_count, _valid_size, _committed_size = self._replay()
         self.state = candidate
         self.commit_seq = committed
         return RecoveryResult(
@@ -395,3 +401,32 @@ class WalStore:
             commit_seq=committed,
             pending_count=pending_count,
         )
+
+    def rollback(self):
+        # Validate under the exact same rules as recovery first, replaying
+        # purely into local objects: a log containing anything beyond a
+        # recognised trailing interrupted fragment raises WalCorruptionError
+        # without truncating the file or partially updating in-memory state.
+        _candidate, _committed, pending_count, _valid_size, committed_size = self._replay()
+        if pending_count == 0 and (
+            not self.path.exists() or self.path.stat().st_size <= committed_size
+        ):
+            # Nothing beyond the last committed prefix: no truncation, no new
+            # record or seq, and the durable prefix is left byte-identical.
+            return 0
+        # Remove only bytes after the last commit record -- the complete
+        # uncommitted set/delete records plus any discardable unterminated
+        # tail fragment. Committed bytes are never rewritten or reordered.
+        # A truncate/sync failure propagates as OSError; it must never look
+        # like a successful rollback, so the method returns only after the
+        # shortened log is durable. _valid_size tracks the kernel-visible
+        # length from the moment truncate succeeds, keeping a later failed
+        # fsync from letting _drop_tail_fragment extend the file with zeros.
+        with self.path.open("r+b") as f:
+            f.truncate(committed_size)
+            self._valid_size = committed_size
+            f.flush()
+            os.fsync(f.fileno())
+        # state and commit_seq already describe the last commit; only the
+        # pending tail has ceased to exist.
+        return pending_count
