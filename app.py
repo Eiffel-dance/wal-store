@@ -1,4 +1,6 @@
 import copy
+import errno
+import fcntl
 import json
 import math
 import os
@@ -7,6 +9,14 @@ from pathlib import Path
 
 class WalCorruptionError(ValueError):
     """Raised when the write-ahead log fails validation."""
+
+
+class WalBusyError(Exception):
+    """Raised when an exclusive write lease is already held for the log path."""
+
+
+class WalClosedError(Exception):
+    """Raised when any public method is called on a closed WalStore."""
 
 
 class RecoveryResult(dict):
@@ -153,14 +163,90 @@ def _reject_duplicate_keys(pairs):
 
 
 class WalStore:
-    def __init__(self, path):
+    def __init__(self, path, exclusive=False):
+        if not isinstance(exclusive, bool):
+            raise ValueError(
+                "exclusive must be a bool, got %r" % (type(exclusive).__name__,)
+            )
         self.path = Path(path)
         self.state = {}
         self.commit_seq = 0
         # Byte length of the durable log prefix as judged by the latest
         # replay; anything beyond it is a discarded tail fragment.
         self._valid_size = None
+        self._closed = False
+        self._lock_fd = None
+        if exclusive:
+            # The lease is taken before the log is ever read: a conflicting
+            # open raises WalBusyError without creating, truncating, or
+            # appending to the log.
+            self._acquire_lease()
         self.recover()
+
+    def _acquire_lease(self):
+        """Take the exclusive write lease for this store's log path.
+
+        The lease is an flock on a sibling lock file derived from the
+        normalized absolute log path, so every spelling of the same path
+        competes for the same lease and lease management never creates,
+        truncates, or appends to the log itself. flock locks are held per
+        open file description, so two exclusive instances conflict even
+        within one process, and the kernel releases the lock when the
+        holder's descriptor dies -- a crashed process can never leave the
+        lease blocked, and the leftover lock file holds no lock.
+        """
+        lock_path = os.path.abspath(os.fspath(self.path)) + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise WalBusyError(
+                    "log path is exclusively leased: %r" % (str(self.path),)
+                ) from None
+            raise
+        self._lock_fd = fd
+
+    def close(self):
+        """Release the write lease (if any) and close the store.
+
+        Idempotent: closing an already-closed store is a no-op, and close
+        itself never raises WalClosedError. After close, every other public
+        method raises WalClosedError.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        fd = self._lock_fd
+        self._lock_fd = None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        # Best-effort lease release at garbage collection; the kernel
+        # releases the flock on process death in any case.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _check_open(self):
+        if self._closed:
+            raise WalClosedError("WalStore is closed")
 
     def _drop_tail_fragment(self):
         """Remove a discarded tail fragment left by an interrupted write.
@@ -228,6 +314,7 @@ class WalStore:
     def set(self, key, value):
         # Validate fully before touching the log: a rejected call must never
         # create, truncate, or append to the file or alter in-memory state.
+        self._check_open()
         _validate_key(key)
         _validate_value(value)
         self._append(
@@ -235,6 +322,7 @@ class WalStore:
         )
 
     def delete(self, key):
+        self._check_open()
         _validate_key(key)
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
@@ -243,12 +331,14 @@ class WalStore:
         # once it is durable: a failed write must neither consume the seq nor
         # present a committed state.
         seq = self.commit_seq + 1
+        self._check_open()
         self._append({"op": "commit", "seq": seq})
         self.recover()
         return self.commit_seq
 
     def rollback(self):
         # Validate the log by the exact recovery rules before touching
+        self._check_open()
         # anything. The replay builds only local objects, so corruption raises
         # WalCorruptionError without partially replacing state or commit_seq.
         # committed_size is the byte offset just past the last commit record;
@@ -289,6 +379,7 @@ class WalStore:
         return candidate, committed
 
     def get(self, key, default=_UNSET):
+        self._check_open()
         _validate_key(key)
         if default is not _UNSET:
             _validate_value(default)
@@ -304,6 +395,7 @@ class WalStore:
         raise KeyError(key)
 
     def contains(self, key):
+        self._check_open()
         _validate_key(key)
         state, _committed = self._committed_view()
         return key in state
@@ -319,6 +411,7 @@ class WalStore:
         latest committed seq; 0 yields the empty state. The log, the public
         state, and commit_seq are never touched.
         """
+        self._check_open()
         history = []
         _candidate, committed, _pending, _valid_size, _committed_size = self._replay(
             snapshots=history
@@ -374,6 +467,7 @@ class WalStore:
         repeated calls on the same log prefix, including after a reopen,
         return identical results.
         """
+        self._check_open()
         if (
             isinstance(since_seq, bool)
             or not isinstance(since_seq, int)
@@ -446,6 +540,7 @@ class WalStore:
         to; no seq is consumed and the public state stays at the last
         committed view.
         """
+        self._check_open()
         changes = []
         # As in audit, the replay is purely observational: restore the
         # cached accepted-prefix boundary so this query can never
@@ -498,6 +593,7 @@ class WalStore:
         in-memory state. Repeated calls, including on a reopened instance,
         return identical fields and values.
         """
+        self._check_open()
         # _replay caches the accepted-prefix length on the instance for a
         # later append; audit is purely observational and must not influence
         # that decision, so restore whatever was cached before (the replay
@@ -549,6 +645,7 @@ class WalStore:
         raw number of tail bytes removed; on return the repaired log is
         durable and a reopen recovers exactly the accepted prefix.
         """
+        self._check_open()
         # The replay raises WalCorruptionError before the file or the
         # adopted state can be touched, and its accepted-prefix boundary is
         # the same valid_bytes audit reports.
@@ -769,6 +866,7 @@ class WalStore:
     def recover(self):
         # Replay purely into local objects first; raising WalCorruptionError
         # must never partially replace the current in-memory state.
+        self._check_open()
         candidate, committed, pending_count, _valid_size, _committed_size = self._replay()
         self.state = candidate
         self.commit_seq = committed
