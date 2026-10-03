@@ -2143,5 +2143,196 @@ class HistoryTest(unittest.TestCase):
         )
 
 
+class ExclusiveLeaseTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_exclusive_flag_must_be_bool(self):
+        for bad in (1, 0, "yes", None, object()):
+            with self.assertRaises(ValueError):
+                WalStore(self.path, exclusive=bad)
+        # the failed constructions never created the log
+        self.assertFalse(self.path.exists())
+
+    def test_exclusive_open_write_commit_recover(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        r = s.pending_changes()
+        self.assertEqual(r["pending_count"], 1)
+        s.rollback()
+        s.close()
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        s2.close()
+
+    def test_busy_raises_before_reading_and_leaves_everything_untouched(self):
+        s1 = WalStore(self.path, exclusive=True)
+        s1.set("a", 1)
+        s1.commit()
+        data = self.path.read_bytes()
+        # repeated conflicts are all observable as the same unique error
+        for _ in range(3):
+            with self.assertRaises(app.WalBusyError):
+                WalStore(self.path, exclusive=True)
+        # the log was not created, truncated, appended, or rewritten
+        self.assertEqual(self.path.read_bytes(), data)
+        # the holder's state and commit_seq are unchanged and it keeps working
+        self.assertEqual((s1.state, s1.commit_seq), ({"a": 1}, 1))
+        s1.set("b", 2)
+        s1.commit()
+        self.assertEqual((s1.state, s1.commit_seq), ({"a": 1, "b": 2}, 2))
+        s1.close()
+
+    def test_busy_same_path_normalization(self):
+        s1 = WalStore(self.path, exclusive=True)
+        alias = Path(self.dir.name) / "." / ".." / Path(self.dir.name).name / "store.wal"
+        with self.assertRaises(app.WalBusyError):
+            WalStore(alias, exclusive=True)
+        s1.close()
+
+    def test_busy_even_when_log_is_corrupt(self):
+        # the lease conflict surfaces before the log is read: corruption
+        # must not mask WalBusyError
+        s1 = WalStore(self.path, exclusive=True)
+        s1.set("a", 1)
+        s1.commit()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("not json\n")
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        s1.close()
+        # once released, the corruption is reported by the usual rules
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, exclusive=True)
+
+    def test_non_exclusive_open_does_not_conflict(self):
+        s1 = WalStore(self.path, exclusive=True)
+        s1.set("a", 1)
+        s1.commit()
+        # default and explicit False opens still work while the lease is held
+        s2 = WalStore(self.path)
+        s3 = WalStore(self.path, exclusive=False)
+        self.assertEqual(s2.state, {"a": 1})
+        self.assertEqual(s3.state, {"a": 1})
+        s1.close()
+
+    def test_close_is_idempotent_and_methods_raise_closed(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        s.close()
+        for call in (
+            lambda: s.recover(),
+            lambda: s.set("b", 2),
+            lambda: s.delete("a"),
+            lambda: s.commit(),
+            lambda: s.rollback(),
+            lambda: s.get("a"),
+            lambda: s.contains("a"),
+            lambda: s.snapshot(),
+            lambda: s.history(),
+            lambda: s.pending_changes(),
+            lambda: s.audit(),
+            lambda: s.repair_tail(),
+        ):
+            with self.assertRaises(app.WalClosedError):
+                call()
+        # close itself stays exempt
+        s.close()
+
+    def test_context_manager_releases_lease(self):
+        with WalStore(self.path, exclusive=True) as s:
+            s.set("a", 1)
+            s.commit()
+            with self.assertRaises(app.WalBusyError):
+                WalStore(self.path, exclusive=True)
+        with self.assertRaises(app.WalClosedError):
+            s.get("a")
+        # the lease was released on exit; a fresh exclusive open recovers
+        with WalStore(self.path, exclusive=True) as s2:
+            self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+
+    def test_lease_reacquisition_after_close_preserves_results(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", {"n": [1, 2]})
+        s.commit()
+        s.set("b", 2)
+        s.commit()
+        before = (
+            s.snapshot(),
+            s.history(),
+            s.audit(),
+        )
+        s.close()
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": {"n": [1, 2]}, "b": 2}, 2))
+        self.assertEqual((s2.snapshot(), s2.history(), s2.audit()), before)
+        s2.close()
+
+    def test_lease_released_on_process_death(self):
+        import subprocess
+        import sys
+        import time
+
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys, time;"
+                "sys.path.insert(0, %r);"
+                "from app import WalStore;"
+                "s = WalStore(%r, exclusive=True);"
+                "s.set('k', 1);"
+                "s.commit();"
+                "time.sleep(30)"
+                % (str(Path(app.__file__).parent), str(self.path)),
+            ]
+        )
+        try:
+            # wait until the child holds the lease: our exclusive open must
+            # keep failing with WalBusyError while the child lives
+            deadline = time.time() + 10
+            while True:
+                try:
+                    WalStore(self.path, exclusive=True)
+                except app.WalBusyError:
+                    break
+                if time.time() > deadline:
+                    self.fail("child never acquired the lease")
+                time.sleep(0.05)
+        finally:
+            holder.kill()
+            holder.wait()
+        # the killed process left no stale state behind: recovery proceeds
+        # by the usual rules and sees exactly the last commit
+        s = WalStore(self.path, exclusive=True)
+        self.assertEqual((s.state, s.commit_seq), ({"k": 1}, 1))
+        s.close()
+
+    def test_exclusive_repair_tail_and_crash_fragment(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        # simulate an interrupted write: a partial record at the tail
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b", "va')
+        r = s.repair_tail()
+        self.assertGreater(r["removed_bytes"], 0)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s.close()
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s2.audit()["tail_bytes"], 0)
+        s2.close()
+
+
 if __name__ == "__main__":
     unittest.main()
