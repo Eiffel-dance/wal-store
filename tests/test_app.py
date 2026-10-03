@@ -1603,5 +1603,203 @@ class RepairTailTest(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
 
+class HistoryTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()  # seq 1
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()  # seq 2
+        s.commit()  # seq 3: empty commit
+        s.set("tail", 9)  # uncommitted
+        return s
+
+    def test_default_exports_all_commits(self):
+        s = self.build()
+        h = s.history()
+        self.assertEqual(
+            h,
+            [
+                {
+                    "commit_seq": 1,
+                    "changes": [
+                        {"op": "set", "key": "a", "value": 1},
+                        {"op": "set", "key": "b", "value": {"n": [1]}},
+                    ],
+                },
+                {
+                    "commit_seq": 2,
+                    "changes": [
+                        {"op": "delete", "key": "a"},
+                        {"op": "set", "key": "c", "value": 3},
+                    ],
+                },
+                {"commit_seq": 3, "changes": []},
+            ],
+        )
+
+    def test_empty_and_nonexistent_log_return_empty(self):
+        s = WalStore(self.path)  # path does not exist
+        self.assertEqual(s.history(), [])
+        self.assertEqual(s.history(0), [])
+        self.assertEqual(s.history(0, 0), [])
+        self.assertFalse(self.path.exists())
+        self.path.write_bytes(b"")
+        self.assertEqual(s.history(), [])
+
+    def test_range_filters_commits(self):
+        s = self.build()
+        self.assertEqual([e["commit_seq"] for e in s.history(0, 2)], [1, 2])
+        self.assertEqual([e["commit_seq"] for e in s.history(1)], [2, 3])
+        self.assertEqual([e["commit_seq"] for e in s.history(1, 2)], [2])
+        self.assertEqual([e["commit_seq"] for e in s.history(2, 2)], [])
+        self.assertEqual([e["commit_seq"] for e in s.history(3)], [])
+        self.assertEqual([e["commit_seq"] for e in s.history(0, 3)], [1, 2, 3])
+        # until_seq=None is the latest committed seq
+        self.assertEqual(s.history(0, None), s.history())
+        self.assertEqual(s.history(1, None), s.history(1))
+
+    def test_uncommitted_tail_never_exported(self):
+        s = self.build()
+        for entry in s.history():
+            for change in entry["changes"]:
+                self.assertNotEqual(change.get("key"), "tail")
+        # a log with only uncommitted records has no history
+        self.write_lines({"op": "set", "key": "p", "value": 1, "seq": 1})
+        self.assertEqual(WalStore(self.path).history(), [])
+
+    def test_invalid_arguments_raise_valueerror(self):
+        s = self.build()
+        for bad in (True, False, -1, 1.0, "1", b"1", [1], {"s": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.history(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                s.history(0, bad)
+        with self.assertRaises(ValueError):
+            s.history(2, 1)  # inverted range
+        with self.assertRaises(ValueError):
+            s.history(3, 0)
+        # beyond the latest committed seq (latest is 3)
+        with self.assertRaises(ValueError):
+            s.history(4)
+        with self.assertRaises(ValueError):
+            s.history(0, 4)
+        with self.assertRaises(ValueError):
+            s.history(10**9)
+        # on an empty log any positive bound exceeds the latest seq
+        empty = WalStore(Path(self.dir.name) / "other.wal")
+        with self.assertRaises(ValueError):
+            empty.history(1)
+        with self.assertRaises(ValueError):
+            empty.history(0, 1)
+
+    def test_argument_errors_precede_log_validation(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # corrupt record
+        with self.assertRaises(ValueError):
+            s.history(-1)
+        with self.assertRaises(ValueError):
+            s.history(3, 1)
+        with self.assertRaises(WalCorruptionError):
+            s.history()
+
+    def test_result_is_independent_deep_copy(self):
+        s = self.build()
+        h = s.history()
+        h[0]["changes"][1]["value"]["n"].append(99)
+        h[0]["changes"].append({"op": "set", "key": "x", "value": 1})
+        h.append({"commit_seq": 99, "changes": []})
+        again = s.history()
+        self.assertEqual(len(again), 3)
+        self.assertEqual(again[0]["changes"][1]["value"], {"n": [1]})
+        self.assertEqual(len(again[0]["changes"]), 2)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(WalStore(self.path).history(), again)
+
+    def test_history_is_read_only(self):
+        s = self.build()
+        size = self.log_size()
+        for args in ((), (0,), (1, 2), (0, None)):
+            s.history(*args)
+        self.assertEqual(self.log_size(), size)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.recover()["pending_count"], 1)
+
+    def test_deterministic_across_calls_and_reopens(self):
+        s = self.build()
+        first = s.history()
+        for _ in range(3):
+            self.assertEqual(s.history(), first)
+            self.assertEqual(WalStore(self.path).history(), first)
+
+    def test_corruption_anywhere_raises_no_partial_result(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # invalid, terminated
+        for args in ((), (0,), (1, 2), (0, 3)):
+            with self.assertRaises(WalCorruptionError, msg=args):
+                s.history(*args)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+
+    def test_tail_fragment_does_not_affect_history(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "frag"')  # interrupted write
+        size = self.log_size()
+        h = s.history()
+        self.assertEqual([e["commit_seq"] for e in h], [1, 2, 3])
+        self.assertEqual(self.log_size(), size)  # fragment left in place
+
+    def test_legacy_log_serves_history(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "k", "value": 2, "seq": 2},
+            {"op": "delete", "key": "k", "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.history(),
+            [
+                {
+                    "commit_seq": 1,
+                    "changes": [{"op": "set", "key": "k", "value": 1}],
+                },
+                {
+                    "commit_seq": 2,
+                    "changes": [
+                        {"op": "set", "key": "k", "value": 2},
+                        {"op": "delete", "key": "k"},
+                    ],
+                },
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

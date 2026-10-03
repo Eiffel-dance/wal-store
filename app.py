@@ -348,6 +348,77 @@ class WalStore:
             state = dict(history)[target_seq]
         return RecoveryResult(state=state, commit_seq=target_seq)
 
+    def history(self, since_seq=0, until_seq=None):
+        """Read-only export of committed change batches, in commit order.
+
+        Argument form is validated first: since_seq must be a non-boolean
+        non-negative integer, and until_seq -- when given (None means the
+        latest committed seq) -- likewise, with since_seq <= until_seq;
+        any type error, negative value, or inverted range raises
+        ValueError. The whole log is then parsed under the exact recovery
+        rules -- UTF-8, JSON, field sets, duplicate fields, seq
+        continuity, the terminator adoption boundary, and JSON values --
+        with a trailing interrupted-write fragment ignored by the recover
+        rules and uncommitted set/delete records left in the log only;
+        any other corruption raises WalCorruptionError with no partial
+        result. Once the latest committed seq is known, a since_seq above
+        it or an until_seq beyond it also raises ValueError.
+
+        Returns a list, in commit order, of one entry per commit with
+        since_seq < commit_seq <= until_seq: {"commit_seq": seq,
+        "changes": [...]}, where changes preserves the batch's log write
+        order -- set items carry op/key/value, delete items op/key -- and
+        an empty commit yields an empty changes list. Every returned
+        object and nested value is an independent deep copy; the log, the
+        public state, commit_seq, and pending_count are never touched, and
+        repeated calls on the same log prefix, including after a reopen,
+        return identical results.
+        """
+        if (
+            isinstance(since_seq, bool)
+            or not isinstance(since_seq, int)
+            or since_seq < 0
+        ):
+            raise ValueError(
+                "since_seq must be a non-negative integer, got %r" % (since_seq,)
+            )
+        if until_seq is not None and (
+            isinstance(until_seq, bool)
+            or not isinstance(until_seq, int)
+            or until_seq < 0
+        ):
+            raise ValueError(
+                "until_seq must be a non-negative integer, got %r" % (until_seq,)
+            )
+        if until_seq is not None and since_seq > until_seq:
+            raise ValueError(
+                "since_seq %r exceeds until_seq %r" % (since_seq, until_seq)
+            )
+        batches = []
+        _candidate, committed, _pending, _valid_size, _committed_size = self._replay(
+            batches=batches
+        )
+        if until_seq is None:
+            until_seq = committed
+        if since_seq > committed:
+            raise ValueError(
+                "since_seq %r exceeds latest committed seq %r"
+                % (since_seq, committed)
+            )
+        if until_seq > committed:
+            raise ValueError(
+                "until_seq %r exceeds latest committed seq %r"
+                % (until_seq, committed)
+            )
+        # Commit seqs are contiguous from 1, so the recorded batches are
+        # already in commit order; the changes were deep-copied when the
+        # batch was recorded, so the caller may mutate the result freely.
+        return [
+            {"commit_seq": seq, "changes": changes}
+            for seq, changes in batches
+            if since_seq < seq <= until_seq
+        ]
+
     def audit(self):
         """Read-only audit of the accepted prefix and any trailing fragment.
 
@@ -470,12 +541,16 @@ class WalStore:
             removed_bytes=removed_bytes,
         )
 
-    def _replay(self, snapshots=None):
+    def _replay(self, snapshots=None, batches=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
         # appended, in commit order, so historical committed views can be
-        # served without re-parsing the log. Purely observational: the
-        # replay itself, its return value, and the log are unaffected.
+        # served without re-parsing the log. batches: likewise, one
+        # (seq, changes) entry per commit record, changes holding the
+        # batch's set/delete records in their original log order (set
+        # items carry op/key/value, delete items op/key; values are deep
+        # copies private to this replay). Both are purely observational:
+        # the replay itself, its return value, and the log are unaffected.
         candidate = {}
         pending = []
         committed = 0
@@ -581,6 +656,23 @@ class WalStore:
                     # reaches this point; anything else raised already.
                     break
                 if op == "commit":
+                    if batches is not None:
+                        # The batch's changes in original log order, with
+                        # values deep-copied so the recorded entry can
+                        # never be mutated through the replay's state.
+                        changes = []
+                        for p in pending:
+                            if p["op"] == "delete":
+                                changes.append({"op": "delete", "key": p["key"]})
+                            else:
+                                changes.append(
+                                    {
+                                        "op": "set",
+                                        "key": p["key"],
+                                        "value": copy.deepcopy(p["value"]),
+                                    }
+                                )
+                        batches.append((seq, changes))
                     # Apply this batch in original set/delete order.
                     for p in pending:
                         if p["op"] == "delete":
