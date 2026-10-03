@@ -348,6 +348,85 @@ class WalStore:
             state = dict(history)[target_seq]
         return RecoveryResult(state=state, commit_seq=target_seq)
 
+    def history(self, since_seq=0, until_seq=None):
+        """Read-only export of committed change batches, in commit order.
+
+        Parameter form is validated first: since_seq must be a non-boolean
+        non-negative integer, and until_seq, when given, must be one too
+        with since_seq <= until_seq; any type error, negative value, or
+        inverted range raises ValueError before the log is touched. The
+        whole log is then parsed under the exact recovery rules -- UTF-8,
+        JSON, field sets, duplicate fields, seq continuity, the terminator
+        adoption boundary, and strict JSON values -- so any corruption
+        (invalid UTF-8 or JSON, empty records, non-standard constants,
+        duplicate fields, bad fields, or a seq break) raises
+        WalCorruptionError with no partial result. A trailing fragment
+        recognisable as an interrupted write is ignored exactly as recover
+        ignores it, and complete but uncommitted set/delete records stay
+        pending-only: they never appear in the export.
+
+        until_seq defaults to the latest committed seq the log recovers to
+        (passing None is the same as omitting it); since_seq defaults to 0.
+        After parsing, a since_seq greater than the latest committed seq or
+        an until_seq beyond it also raises ValueError. Only commits with
+        since_seq < commit_seq <= until_seq are included, so a missing or
+        empty log yields an empty list. Each entry carries commit_seq and
+        changes; changes preserves the batch's log write order, with set
+        entries holding op/key/value and delete entries op/key, and an
+        empty commit yields an empty changes list. Every returned object,
+        nested values included, is an independent deep copy: caller
+        mutation cannot affect the store. The log is never appended to,
+        truncated, reordered, or rewritten, and the public state,
+        commit_seq, and pending_count are untouched, so repeated calls on
+        the same log prefix -- including on a reopened instance -- return
+        identical results.
+        """
+        if (
+            isinstance(since_seq, bool)
+            or not isinstance(since_seq, int)
+            or since_seq < 0
+        ):
+            raise ValueError(
+                "since_seq must be a non-negative integer, got %r" % (since_seq,)
+            )
+        if until_seq is not None and (
+            isinstance(until_seq, bool)
+            or not isinstance(until_seq, int)
+            or until_seq < 0
+        ):
+            raise ValueError(
+                "until_seq must be a non-negative integer or None, got %r"
+                % (until_seq,)
+            )
+        if until_seq is not None and since_seq > until_seq:
+            raise ValueError(
+                "since_seq %r exceeds until_seq %r" % (since_seq, until_seq)
+            )
+        batches = []
+        _candidate, committed, _pending, _valid_size, _committed_size = self._replay(
+            batches=batches
+        )
+        if until_seq is None:
+            until_seq = committed
+        if since_seq > committed:
+            raise ValueError(
+                "since_seq %r exceeds latest committed seq %r" % (since_seq, committed)
+            )
+        if until_seq > committed:
+            raise ValueError(
+                "until_seq %r exceeds latest committed seq %r"
+                % (until_seq, committed)
+            )
+        # Commit seqs are contiguous from 1, so the batches are already in
+        # commit order; each change list is an independent deep copy private
+        # to this call, and the extra copy below keeps the returned objects
+        # independent even of the replay's own bookkeeping.
+        return [
+            RecoveryResult(commit_seq=seq, changes=copy.deepcopy(changes))
+            for seq, changes in batches
+            if since_seq < seq <= until_seq
+        ]
+
     def audit(self):
         """Read-only audit of the accepted prefix and any trailing fragment.
 
@@ -470,12 +549,16 @@ class WalStore:
             removed_bytes=removed_bytes,
         )
 
-    def _replay(self, snapshots=None):
+    def _replay(self, snapshots=None, batches=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
         # appended, in commit order, so historical committed views can be
-        # served without re-parsing the log. Purely observational: the
-        # replay itself, its return value, and the log are unaffected.
+        # served without re-parsing the log. batches: likewise, one
+        # (seq, deep-copied-change-list) entry per commit record, each
+        # change keeping the batch's original log order (set entries carry
+        # op/key/value, delete entries op/key). Both are purely
+        # observational: the replay itself, its return value, and the log
+        # are unaffected.
         candidate = {}
         pending = []
         committed = 0
@@ -581,6 +664,24 @@ class WalStore:
                     # reaches this point; anything else raised already.
                     break
                 if op == "commit":
+                    if batches is not None:
+                        # An independent deep copy of this batch's changes in
+                        # original log order, taken before the batch is
+                        # applied; later batches and caller mutation must
+                        # never affect it. An empty commit yields [].
+                        changes = []
+                        for p in pending:
+                            if p["op"] == "delete":
+                                changes.append({"op": "delete", "key": p["key"]})
+                            else:
+                                changes.append(
+                                    {
+                                        "op": "set",
+                                        "key": p["key"],
+                                        "value": p["value"],
+                                    }
+                                )
+                        batches.append((seq, copy.deepcopy(changes)))
                     # Apply this batch in original set/delete order.
                     for p in pending:
                         if p["op"] == "delete":
