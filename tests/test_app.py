@@ -2249,6 +2249,7 @@ class ExclusiveLeaseTest(unittest.TestCase):
             lambda: s.pending_changes(),
             lambda: s.audit(),
             lambda: s.repair_tail(),
+            lambda: s.restore(0),
         ]
         for call in calls:
             with self.assertRaises(app.WalClosedError):

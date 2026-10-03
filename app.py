@@ -19,6 +19,10 @@ class WalClosedError(Exception):
     """Raised when any public method is called on a closed WalStore."""
 
 
+class WalPendingError(Exception):
+    """Raised by restore() when uncommitted or unfinished writes remain."""
+
+
 class RecoveryResult(dict):
     """Plain result mapping; keys are also readable as attributes."""
 
@@ -92,6 +96,28 @@ def _is_incomplete_record(exc, line):
         # "1." / "1e" / "1e+" etc.: the decoder stopped inside a number.
         return msg == "Expecting ',' delimiter" and rest in _NUMBER_TAILS
     return False
+
+
+def _json_equal(left, right):
+    """Type-sensitive structural equality for parsed JSON values.
+
+    Unlike Python's ==, JSON types stay distinct: 1 is not equal to true
+    (int vs bool) nor to 1.0 (int vs float), including inside nested
+    arrays and objects; object member sets must match exactly.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        if set(left) != set(right):
+            return False
+        return all(_json_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_equal(x, y) for x, y in zip(left, right)
+        )
+    return left == right
 
 
 def _validate_key(key):
@@ -368,6 +394,109 @@ class WalStore:
             os.fsync(f.fileno())
         self._valid_size = committed_size
         return pending_count
+
+    def restore(self, target_seq):
+        """Commit a fresh batch that returns the store to a past snapshot.
+
+        The target committed state is written back as the new current
+        state: the union of the current and target change keys is written
+        in Unicode key order (set for keys the target adds or holds with a
+        JSON-type-sensitive different value, delete for keys missing in the
+        target), followed by one new commit record. The target and current
+        states being identical still writes that empty batch and advances
+        the seq exactly once; target_seq 0 restores the empty state, also
+        on an empty log. Old commit content is never rewritten -- the
+        restore is simply a later commit, so snapshot/history and a reopen
+        all show the same new state and seq.
+
+        target_seq must be a non-boolean non-negative integer no greater
+        than the latest committed seq at call time; type errors, negatives,
+        and out-of-range values raise ValueError. The log is validated
+        under the exact recover/snapshot rules first (corruption raises
+        WalCorruptionError), and any fully written but uncommitted
+        set/delete, or a trailing unfinished fragment recognisable by
+        recover/audit, raises WalPendingError -- in all these rejection
+        cases the file, state, and commit_seq stay untouched. Only once
+        every change record and the commit boundary are durable does the
+        new state get adopted; an OSError from a write or fsync propagates
+        with the old committed state and seq unchanged, and the records
+        already durably written stay pending for rollback to clear.
+        """
+        self._check_open()
+        # Validate the whole log purely into local objects first, under
+        # exactly the recover/snapshot rules: corruption raises
+        # WalCorruptionError, and neither the file nor the adopted state is
+        # touched before validation completes. Argument form is checked
+        # afterwards, exactly as snapshot does.
+        history_snapshots = []
+        candidate, committed, pending_count, valid_size, _committed_size = (
+            self._replay(snapshots=history_snapshots)
+        )
+        if (
+            isinstance(target_seq, bool)
+            or not isinstance(target_seq, int)
+            or target_seq < 0
+        ):
+            raise ValueError(
+                "target_seq must be a non-negative integer, got %r"
+                % (target_seq,)
+            )
+        if target_seq > committed:
+            raise ValueError(
+                "target_seq %r exceeds latest committed seq %r"
+                % (target_seq, committed)
+            )
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > valid_size:
+            # Complete-but-uncommitted set/delete records, or a trailing
+            # unfinished fragment recover/audit would recognise, block a
+            # restore: the single writer must settle them (commit or
+            # rollback / repair_tail) before returning to a known version.
+            raise WalPendingError(
+                "log has %r uncommitted record(s) and %r unfinished tail "
+                "byte(s)" % (pending_count, file_size - valid_size)
+            )
+        if target_seq == 0:
+            target_state = {}
+        else:
+            # Commit seqs are contiguous from 1; the snapshot captured at
+            # the target boundary is already a deep copy private to this
+            # replay.
+            target_state = dict(history_snapshots)[target_seq]
+        seq = committed + 1
+        # Merge the changed keys of the two states. Comparison distinguishes
+        # JSON types: 1 is not equal to True and 1.0 is not equal to 1 even
+        # though Python would call them equal.
+        changes = []
+        for key in sorted(set(candidate) | set(target_state)):
+            if key not in target_state:
+                changes.append({"op": "delete", "key": key})
+            elif key not in candidate or not _json_equal(
+                candidate[key], target_state[key]
+            ):
+                changes.append(
+                    {
+                        "op": "set",
+                        "key": key,
+                        "value": copy.deepcopy(target_state[key]),
+                    }
+                )
+        # Write the whole batch against the pre-validation boundary. Every
+        # append is independently durable; if a write or fsync fails, the
+        # OSError propagates and the already-written records simply remain
+        # an uncommitted batch (rollback clears them under its usual
+        # rules). state and commit_seq are not touched until the commit
+        # record itself is durable.
+        for change in changes:
+            row = {"seq": seq}
+            row.update(change)
+            self._append(row)
+        self._append({"op": "commit", "seq": seq})
+        # Replay the just-written batch into the adopted view, exactly as
+        # commit() does, so state is rebuilt from the log rather than
+        # assumed.
+        self.recover()
+        return self.commit_seq
 
     def _committed_view(self):
         # Replay the log purely into local objects, exactly like recovery, but
