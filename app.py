@@ -401,6 +401,75 @@ class WalStore:
             tail_bytes=file_size - valid_size,
         )
 
+    def repair_tail(self):
+        """Remove an unfinished write fragment left at the log's end.
+
+        Validates the whole log under exactly the same rules as recover and
+        audit -- UTF-8, JSON, record fields, seq continuity, the terminator
+        adoption boundary, and duplicate fields -- building only local
+        objects first. Anything after the accepted prefix that is not
+        provably the single trailing fragment of an interrupted write (blank
+        lines, trailing whitespace, illegal UTF-8, non-standard JSON
+        constants, duplicate fields, a wrong field set, a seq break, an
+        unknown op, or any other unrecognisable content) raises
+        WalCorruptionError with the file, state, and commit_seq untouched.
+
+        When a fragment exists it is removed in place: the log is truncated
+        strictly to audit's valid_bytes, so no earlier byte is ever
+        rewritten and no complete (terminated) set/delete record --
+        uncommitted ones included -- is removed; they stay pending and keep
+        following rollback's semantics. An OSError from opening,
+        truncating, flushing, or syncing propagates with the in-memory
+        commit state untouched. A missing log, an empty log, or a log with
+        no trailing fragment reports removed_bytes 0 and never creates a
+        file. Returns the recover triple -- state being an independent deep
+        copy of the post-repair replayable view -- plus removed_bytes, the
+        raw number of tail bytes removed; on return the repaired log is
+        durable and a reopen recovers exactly the accepted prefix.
+        """
+        # The replay raises WalCorruptionError before the file or the
+        # adopted state can be touched, and its accepted-prefix boundary is
+        # the same valid_bytes audit reports.
+        (
+            candidate,
+            committed,
+            pending_count,
+            valid_size,
+            _committed_size,
+        ) = self._replay()
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        removed_bytes = file_size - valid_size
+        if removed_bytes <= 0:
+            # No unfinished fragment (a missing or empty log included):
+            # nothing is created, opened, truncated, or synced.
+            self.state = candidate
+            self.commit_seq = committed
+            self._valid_size = valid_size
+            return RecoveryResult(
+                state=copy.deepcopy(candidate),
+                commit_seq=committed,
+                pending_count=pending_count,
+                removed_bytes=0,
+            )
+        # Shrink the log in place strictly to the accepted prefix. Only the
+        # tail fragment is removed; prefix bytes are never rewritten or
+        # reordered. Let any OSError from open/truncate/flush/fsync
+        # propagate -- a failed repair must never masquerade as success --
+        # and adopt the replayed view only once the truncation is durable.
+        with self.path.open("r+b") as f:
+            f.truncate(valid_size)
+            f.flush()
+            os.fsync(f.fileno())
+        self.state = candidate
+        self.commit_seq = committed
+        self._valid_size = valid_size
+        return RecoveryResult(
+            state=copy.deepcopy(candidate),
+            commit_seq=committed,
+            pending_count=pending_count,
+            removed_bytes=removed_bytes,
+        )
+
     def _replay(self, snapshots=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
