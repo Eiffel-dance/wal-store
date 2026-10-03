@@ -152,6 +152,15 @@ def _reject_duplicate_keys(pairs):
     return dict(pairs)
 
 
+def _change_item(p):
+    # One exported change entry for a pending set/delete record: set items
+    # carry op/key/value, delete items op/key, with values deep-copied so
+    # the entry can never be mutated through the replay's state.
+    if p["op"] == "delete":
+        return {"op": "delete", "key": p["key"]}
+    return {"op": "set", "key": p["key"], "value": copy.deepcopy(p["value"])}
+
+
 class WalStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -419,6 +428,42 @@ class WalStore:
             if since_seq < seq <= until_seq
         ]
 
+    def pending_changes(self):
+        """Read-only view of the complete but uncommitted log records.
+
+        Parses the log under exactly the same rules as recover -- UTF-8,
+        JSON objects, duplicate fields, per-op field sets, positive and
+        contiguous seqs, key/value types, and the terminator adoption
+        boundary -- building only local objects. A trailing fragment that
+        recover would discard (an interrupted-write JSON prefix, a complete
+        record without its terminator, or truncated UTF-8 bytes) is ignored
+        the same way and never appears in the result; any other corruption
+        (illegal UTF-8, non-standard JSON constants, empty records,
+        duplicate fields, wrong field sets, unknown ops, seq breaks, or
+        illegal value types) raises WalCorruptionError with no partial
+        result and no change to state, commit_seq, or the file.
+
+        Returns a RecoveryResult with commit_seq (the seq of the last
+        complete commit record), pending_count, and changes: the fully
+        written set/delete records after that commit, in log order -- set
+        items carry op/key/value, delete items op/key, and nested values
+        are independent deep copies, so the caller may mutate the result
+        freely without affecting the store, later commits or rollbacks, a
+        reopened instance, or repeated calls. With no pending records the
+        result is the current commit_seq, 0, and an empty list. The call
+        never adopts uncommitted changes into the visible state, never
+        consumes a seq, and never truncates or appends to the log.
+        """
+        changes = []
+        _candidate, committed, _pending, _valid_size, _committed_size = self._replay(
+            pending_out=changes
+        )
+        return RecoveryResult(
+            commit_seq=committed,
+            pending_count=len(changes),
+            changes=changes,
+        )
+
     def audit(self):
         """Read-only audit of the accepted prefix and any trailing fragment.
 
@@ -541,7 +586,7 @@ class WalStore:
             removed_bytes=removed_bytes,
         )
 
-    def _replay(self, snapshots=None, batches=None):
+    def _replay(self, snapshots=None, batches=None, pending_out=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
         # appended, in commit order, so historical committed views can be
@@ -549,8 +594,12 @@ class WalStore:
         # (seq, changes) entry per commit record, changes holding the
         # batch's set/delete records in their original log order (set
         # items carry op/key/value, delete items op/key; values are deep
-        # copies private to this replay). Both are purely observational:
-        # the replay itself, its return value, and the log are unaffected.
+        # copies private to this replay). pending_out: likewise, one
+        # change entry per set/delete record still pending at the end of
+        # the accepted prefix, in log order and with the same item shape
+        # and deep-copy guarantees as batches. All three are purely
+        # observational: the replay itself, its return value, and the log
+        # are unaffected.
         candidate = {}
         pending = []
         committed = 0
@@ -660,19 +709,7 @@ class WalStore:
                         # The batch's changes in original log order, with
                         # values deep-copied so the recorded entry can
                         # never be mutated through the replay's state.
-                        changes = []
-                        for p in pending:
-                            if p["op"] == "delete":
-                                changes.append({"op": "delete", "key": p["key"]})
-                            else:
-                                changes.append(
-                                    {
-                                        "op": "set",
-                                        "key": p["key"],
-                                        "value": copy.deepcopy(p["value"]),
-                                    }
-                                )
-                        batches.append((seq, changes))
+                        batches.append((seq, [_change_item(p) for p in pending]))
                     # Apply this batch in original set/delete order.
                     for p in pending:
                         if p["op"] == "delete":
@@ -693,6 +730,11 @@ class WalStore:
                 if op == "commit":
                     committed_size = valid_size
         self._valid_size = valid_size
+        if pending_out is not None:
+            # The set/delete records still pending at the end of the
+            # accepted prefix, in log order; discarded tail fragments never
+            # reach this list.
+            pending_out.extend(_change_item(p) for p in pending)
         return candidate, committed, len(pending), valid_size, committed_size
 
     def recover(self):
