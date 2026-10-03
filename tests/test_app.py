@@ -1603,6 +1603,348 @@ class RepairTailTest(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
 
 
+class PendingChangesTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def test_nonexistent_and_empty_log(self):
+        s = WalStore(self.path)  # path does not exist
+        r = s.pending_changes()
+        self.assertEqual(set(r), {"commit_seq", "pending_count", "changes"})
+        self.assertEqual(
+            (r.commit_seq, r.pending_count, r.changes), (0, 0, [])
+        )
+        # attribute and mapping access agree
+        self.assertEqual(r["commit_seq"], 0)
+        self.assertEqual(r["pending_count"], 0)
+        self.assertEqual(r["changes"], [])
+        self.assertFalse(self.path.exists())  # never created
+        self.path.write_bytes(b"")
+        self.assertEqual(dict(s.pending_changes()), dict(r))
+
+    def test_no_pending_after_commit_returns_current_seq(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.commit()  # empty commit
+        r = s.pending_changes()
+        self.assertEqual(
+            (r.commit_seq, r.pending_count, r.changes), (2, 0, [])
+        )
+
+    def test_pending_set_and_delete_in_log_order_with_exact_fields(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"nested": [1, 2]})
+        s.commit()
+        s.set("c", 3)
+        s.delete("a")
+        s.set("a", 99)
+        r = s.pending_changes()
+        self.assertEqual(r.commit_seq, 1)
+        self.assertEqual(r.pending_count, 3)
+        self.assertEqual(len(r.changes), 3)
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "c", "value": 3},
+                {"op": "delete", "key": "a"},
+                {"op": "set", "key": "a", "value": 99},
+            ],
+        )
+        # seq is not exposed; only the specified field sets are
+        self.assertEqual(set(r.changes[0]), {"op", "key", "value"})
+        self.assertEqual(set(r.changes[1]), {"op", "key"})
+        # the committed view is unaffected by the pending batch
+        self.assertEqual(s.state, {"a": 1, "b": {"nested": [1, 2]}})
+        self.assertEqual(s.get("a"), 1)
+        self.assertIs(s.contains("c"), False)
+
+    def test_records_before_any_commit_are_pending(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "delete", "key": "k", "seq": 1},
+        )
+        s = WalStore(self.path)
+        r = s.pending_changes()
+        self.assertEqual(
+            (r.commit_seq, r.pending_count), (0, 2)
+        )
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "k", "value": 1},
+                {"op": "delete", "key": "k"},
+            ],
+        )
+
+    def test_tail_fragments_are_discarded_not_returned(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # complete, terminated, pending
+        prefix_end = self.log_size()
+        fragments = [
+            '{"op": "set", "key": "x"',  # unfinished JSON prefix
+            "{",
+            '{"op": "commit", "seq": 2',
+            json.dumps({"op": "set", "key": "x", "value": 9, "seq": 2}),
+            '{"op": "set", "key": "hé'.encode("utf-8")[:-1],  # truncated UTF-8
+        ]
+        for frag in fragments:
+            raw = frag if isinstance(frag, bytes) else frag.encode("utf-8")
+            self.path.write_bytes(self.path.read_bytes()[:prefix_end])
+            self.append_bytes(raw)
+            size = self.log_size()
+            r = s.pending_changes()
+            self.assertEqual(r.commit_seq, 1, msg=frag)
+            self.assertEqual(r.pending_count, 1, msg=frag)
+            self.assertEqual(
+                r.changes, [{"op": "set", "key": "b", "value": 2}], msg=frag
+            )
+            # the fragment is left exactly in place
+            self.assertEqual(self.log_size(), size, msg=frag)
+
+    def test_fragment_only_log_returns_empty(self):
+        for frag in ('{"op": "set", "key": "x"', "{"):
+            self.path.write_bytes(frag.encode("utf-8"))
+            s = WalStore(self.path)
+            r = s.pending_changes()
+            self.assertEqual(
+                (r.commit_seq, r.pending_count, r.changes), (0, 0, []),
+                msg=frag,
+            )
+        self.path.write_bytes('{"op": "set", "key": "hé'.encode("utf-8")[:-1])
+        s = WalStore(self.path)
+        r = s.pending_changes()
+        self.assertEqual((r.commit_seq, r.pending_count, r.changes), (0, 0, []))
+
+    def test_changes_are_independent_deep_copies(self):
+        s = WalStore(self.path)
+        s.set("a", {"nested": [1, {"k": 2}]})
+        s.commit()
+        s.set("b", {"v": [3]})
+        s.delete("a")
+        r1 = s.pending_changes()
+        r1.changes[0]["value"]["v"].append(99)
+        r1.changes[0]["value"]["v"][0] = 0
+        r1.changes.append({"op": "set", "key": "z", "value": 1})
+        r1.changes[1]["key"] = "mutated"
+        # store and repeated calls unaffected
+        r2 = s.pending_changes()
+        self.assertEqual(
+            r2.changes,
+            [
+                {"op": "set", "key": "b", "value": {"v": [3]}},
+                {"op": "delete", "key": "a"},
+            ],
+        )
+        self.assertEqual(s.state, {"a": {"nested": [1, {"k": 2}]}})
+        # a reopened instance parses the same log independently
+        reopened = WalStore(self.path).pending_changes()
+        self.assertEqual(reopened.changes, r2.changes)
+
+    def test_mutating_result_does_not_change_later_commit_or_rollback(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", {"n": [1]})
+        s.delete("a")
+        r = s.pending_changes()
+        r.changes[0]["value"]["n"].append(99)
+        r.changes.clear()
+        self.assertEqual(s.pending_changes().pending_count, 2)
+        # commit adopts the real pending records, not the mutated result
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(s.state, {"b": {"n": [1]}})
+        self.assertEqual(
+            (s.pending_changes().commit_seq, s.pending_changes().pending_count),
+            (2, 0),
+        )
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.state, {"b": {"n": [1]}})
+        self.assertEqual(s2.commit_seq, 2)
+
+        # same for rollback on a fresh pending batch
+        s.set("c", 3)
+        s.delete("b")
+        r = s.pending_changes()
+        r.changes[0]["key"] = "mutated"
+        self.assertEqual(s.rollback(), 2)
+        self.assertEqual(s.state, {"b": {"n": [1]}})
+        self.assertEqual(s.pending_changes().changes, [])
+        self.assertEqual(WalStore(self.path).state, {"b": {"n": [1]}})
+
+    def test_read_only_does_not_touch_log_seq_or_state(self):
+        s = WalStore(self.path)
+        s.set("a", {"v": [1]})
+        s.commit()
+        s.set("tail", 2)
+        s.delete("a")
+        self.append_bytes('{"op": "set", "key": "frag"')
+        before = self.path.read_bytes()
+        results = []
+        for _ in range(4):
+            r = s.pending_changes()
+            results.append(dict(r))
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(self.log_size(), len(before))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[1], results[2])
+        self.assertEqual(results[2], results[3])
+        self.assertEqual(s.commit_seq, 1)
+        self.assertEqual(s.state, {"a": {"v": [1]}})
+        self.assertEqual(s.recover()["pending_count"], 2)
+        # state stays the committed view
+        self.assertEqual(s.get("a"), {"v": [1]})
+        self.assertIs(s.contains("tail"), False)
+
+    def test_deterministic_across_reopens(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", 2)
+        s.commit()
+        s.delete("a")
+        s.set("c", [1, 2])
+        expected = [
+            {"op": "delete", "key": "a"},
+            {"op": "set", "key": "c", "value": [1, 2]},
+        ]
+        for _ in range(3):
+            store = WalStore(self.path)
+            r = store.pending_changes()
+            self.assertEqual((r.commit_seq, r.pending_count), (1, 2))
+            self.assertEqual(r.changes, expected)
+
+    def test_pending_changes_then_append_still_drops_fragment(self):
+        # like audit, the query must not disturb the cached accepted-prefix
+        # boundary a later append relies on
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        prefix = self.path.read_bytes()
+        self.append_bytes('{"op": "set", "key": "frag"')
+        s.pending_changes()
+        s.pending_changes()
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        data = self.path.read_bytes()
+        self.assertTrue(data.startswith(prefix))
+        self.assertNotIn(b'"frag"', data)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    def test_corruption_raises_without_partial_result_or_side_effects(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        prefix = self.path.read_bytes()
+        bad_tails = [
+            b"   ",  # trailing whitespace, no terminator
+            b"\n",  # blank line
+            b"  \n",  # blank record
+            b"\xff",  # illegal UTF-8 beyond a discardable tail
+            b'{"op": "set", "key": "x", "value": NaN, "seq": 2}\n',
+            b'{"op": "set", "op": "set", "key": "x", "value": 1, "seq": 2}\n',
+            b'{"op": "set", "key": "x", "value": 1, "seq": 5}\n',  # seq jump
+            b'{"op": "set", "key": "x", "seq": 2}\n',  # missing field
+            b'{"op": "commit", "seq": 2, "extra": 1}\n',  # bad field set
+            b'{"op": "bogus", "seq": 2}\n',  # unknown op
+            b'{"op": "set", "key": "x", "value": 1, "seq": "2"}\n',  # bad seq
+            b"not json\n",
+            b"[1, 2]\n",  # not an object
+            b'{"op": "set", "key": "x", "value": 1, "seq": 2}extra\n',
+        ]
+        for tail in bad_tails:
+            self.path.write_bytes(prefix)
+            self.append_bytes(tail)
+            size = self.log_size()
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                s.pending_changes()
+            # no partial result leaked into memory ...
+            self.assertEqual(s.state, {"a": 1}, msg=tail)
+            self.assertEqual(s.commit_seq, 1, msg=tail)
+            # ... and the file was neither truncated nor appended to
+            self.assertEqual(self.path.read_bytes(), prefix + tail, msg=tail)
+            self.assertEqual(self.log_size(), size, msg=tail)
+            # the still-valid prefix remains independently queryable only
+            # after the corrupt tail is gone
+            self.path.write_bytes(prefix)
+            self.assertEqual(s.pending_changes().pending_count, 1)
+
+    def test_corruption_in_fragment_only_log_raises(self):
+        bad = [
+            b"\xff",
+            b"not json",
+            b'{"op": "set", "key": "a", "value": 1, "seq": 5}',
+            b'{"op": "set", "key": "a", "seq": 1}',
+            b'{"op": "set", "key": "a", "value": 1, "seq": "1"}',
+            b'{"op": "set", "key": "a", "value": 1, "seq": 1}extra',
+        ]
+        for data in bad:
+            self.path.write_bytes(data)
+            with self.assertRaises(WalCorruptionError, msg=data):
+                WalStore(self.path).pending_changes()
+
+    def test_all_json_value_shapes_round_trip(self):
+        s = WalStore(self.path)
+        s.set("committed", 0)
+        s.commit()
+        values = {
+            "i": 1, "f": 1.5, "s": "hi", "b": True, "n": None,
+            "arr": [1, "two", False, None, {"x": []}],
+            "obj": {"k": [1, 2]},
+        }
+        for k, v in values.items():
+            s.set(k, v)
+        changes = s.pending_changes().changes
+        self.assertEqual(
+            changes,
+            [{"op": "set", "key": k, "value": v} for k, v in values.items()],
+        )
+
+    def test_legacy_log_serves_pending_changes_without_migration(self):
+        self.write_lines(
+            {"op": "set", "key": "legacy", "value": [1, 2], "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "tail", "value": {"x": 1}, "seq": 2},
+            {"op": "delete", "key": "legacy", "seq": 2},
+        )
+        s = WalStore(self.path)
+        r = s.pending_changes()
+        self.assertEqual((r.commit_seq, r.pending_count), (1, 2))
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "tail", "value": {"x": 1}},
+                {"op": "delete", "key": "legacy"},
+            ],
+        )
+        size = self.log_size()
+        s.pending_changes()
+        self.assertEqual(self.log_size(), size)
+
+
 class HistoryTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

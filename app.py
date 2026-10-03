@@ -419,6 +419,57 @@ class WalStore:
             if since_seq < seq <= until_seq
         ]
 
+    def pending_changes(self):
+        """Read-only view of the complete uncommitted records after the last commit.
+
+        The whole log is parsed under the exact recovery rules -- UTF-8,
+        JSON objects, duplicate fields, the per-op field sets, positive
+        integer seq continuity, key/value types, and the terminator
+        adoption boundary -- with a trailing interrupted-write fragment
+        (an unfinished JSON prefix, a complete record whose terminator
+        never became durable, or truncated UTF-8 bytes) discarded exactly
+        as recover does: it is neither returned nor counted. Every fully
+        written (terminated) set/delete record beyond the last commit is
+        returned in log order even though it is not committed; any other
+        corruption anywhere in the log raises WalCorruptionError with no
+        partial result and no change to the public state, commit_seq, or
+        the file.
+
+        Returns RecoveryResult with commit_seq (the seq of the last
+        complete commit record, 0 when there is none), pending_count
+        (always equal to len(changes)), and changes -- set items carry
+        op/key/value, delete items op/key; every nested value is an
+        independent deep copy, so mutating the result never affects the
+        store, a later commit/rollback, a reopen, or a repeated call.
+        With no pending records the fields are the current seq, zero, and
+        an empty list. The log is never truncated, rewritten, or appended
+        to; no seq is consumed and the public state stays at the last
+        committed view.
+        """
+        changes = []
+        # As in audit, the replay is purely observational: restore the
+        # cached accepted-prefix boundary so this query can never
+        # influence a later append's decision to drop a tail fragment.
+        # The replay itself builds only local objects and never touches
+        # self.state, so WalCorruptionError propagates with nothing
+        # adopted.
+        saved_valid_size = self._valid_size
+        try:
+            (
+                _candidate,
+                committed,
+                pending_count,
+                _valid_size,
+                _committed_size,
+            ) = self._replay(pending_out=changes)
+        finally:
+            self._valid_size = saved_valid_size
+        return RecoveryResult(
+            commit_seq=committed,
+            pending_count=pending_count,
+            changes=changes,
+        )
+
     def audit(self):
         """Read-only audit of the accepted prefix and any trailing fragment.
 
@@ -541,7 +592,7 @@ class WalStore:
             removed_bytes=removed_bytes,
         )
 
-    def _replay(self, snapshots=None, batches=None):
+    def _replay(self, snapshots=None, batches=None, pending_out=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
         # appended, in commit order, so historical committed views can be
@@ -549,8 +600,12 @@ class WalStore:
         # (seq, changes) entry per commit record, changes holding the
         # batch's set/delete records in their original log order (set
         # items carry op/key/value, delete items op/key; values are deep
-        # copies private to this replay). Both are purely observational:
-        # the replay itself, its return value, and the log are unaffected.
+        # copies private to this replay). pending_out: likewise, filled
+        # once at the end with the records of the single trailing
+        # uncommitted batch in log order (set items carry op/key/value,
+        # delete items op/key; values are deep copies private to this
+        # replay). All three are purely observational: the replay itself,
+        # its return value, and the log are unaffected.
         candidate = {}
         pending = []
         committed = 0
@@ -692,6 +747,22 @@ class WalStore:
                 valid_size += len(seg.encode("utf-8"))
                 if op == "commit":
                     committed_size = valid_size
+        if pending_out is not None:
+            # The trailing uncommitted batch in original log order,
+            # stripped to op/key(/value) and with values deep-copied so
+            # the caller can never mutate the replay's records or the
+            # parsed log objects.
+            for p in pending:
+                if p["op"] == "delete":
+                    pending_out.append({"op": "delete", "key": p["key"]})
+                else:
+                    pending_out.append(
+                        {
+                            "op": "set",
+                            "key": p["key"],
+                            "value": copy.deepcopy(p["value"]),
+                        }
+                    )
         self._valid_size = valid_size
         return candidate, committed, len(pending), valid_size, committed_size
 
