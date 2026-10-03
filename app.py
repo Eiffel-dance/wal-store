@@ -19,6 +19,16 @@ class WalClosedError(Exception):
     """Raised when any public method is called on a closed WalStore."""
 
 
+class WalPendingError(Exception):
+    """Raised by restore() when the log is not settled at the last commit.
+
+    Either complete, terminated set/delete records wait in an uncommitted
+    batch, or an interrupted write leaves an unfinished tail fragment.
+    restore() never splices a new batch into either state; the caller must
+    commit or roll the pending records back (or repair the fragment) first.
+    """
+
+
 class RecoveryResult(dict):
     """Plain result mapping; keys are also readable as attributes."""
 
@@ -140,6 +150,29 @@ def _validate_value(root):
             "value must be composed of JSON-compatible types, got %r"
             % (type(value).__name__,)
         )
+
+
+def _json_equal(a, b):
+    """Deep equality that keeps JSON's number/boolean distinction.
+
+    Python counts True as 1, so a plain == would judge the JSON values
+    1 and true (and 1.0 and true) the same; restore must treat them as
+    different values. The rule is applied recursively so a boolean
+    nested in an object or array still forces a set record. Every other
+    pair follows ordinary equality, under which the JSON number family
+    (int and float) compares numerically.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(
+            _json_equal(x, y) for x, y in zip(a, b)
+        )
+    return a == b
 
 
 def _reject_constant(constant):
@@ -368,6 +401,91 @@ class WalStore:
             os.fsync(f.fileno())
         self._valid_size = committed_size
         return pending_count
+
+    def restore(self, target_seq):
+        """Commit the state of a past commit boundary as a fresh new state.
+
+        Read-only with respect to history: no earlier record is rewritten
+        or reordered, and snapshot/history still serve every old commit.
+        The target state is reached by one new set/delete batch sealed by
+        one new commit, whose seq is latest commit_seq + 1 even when the
+        target equals the current state (an empty batch then) or is 0
+        (an empty state). Returns the new commit_seq.
+
+        target_seq must be a non-boolean non-negative integer no greater
+        than the latest committed seq; type errors, negatives, and
+        out-of-range values raise ValueError before the log is touched.
+        The log is then validated under the exact recover/snapshot rules
+        (corruption anywhere raises WalCorruptionError), and must be
+        settled at the last commit: complete uncommitted set/delete
+        records or a trailing unfinished fragment make it raise
+        WalPendingError with the file, state, and commit_seq untouched.
+        Every change record and the commit are appended and fsynced one
+        at a time as in set/commit; an OSError propagates with the old
+        committed state and seq in place, already-written records simply
+        forming the batch's pending tail (rollback clears them).
+        """
+        self._check_open()
+        if (
+            isinstance(target_seq, bool)
+            or not isinstance(target_seq, int)
+            or target_seq < 0
+        ):
+            raise ValueError(
+                "target_seq must be a non-negative integer, got %r"
+                % (target_seq,)
+            )
+        # Full recover/snapshot validation first, purely into local
+        # objects: corruption raises before any truncation or append.
+        history_views = []
+        candidate, committed, pending_count, _valid_size, _committed_size = (
+            self._replay(snapshots=history_views)
+        )
+        if target_seq > committed:
+            raise ValueError(
+                "target_seq %r exceeds latest committed seq %r"
+                % (target_seq, committed)
+            )
+        # The log must be settled: neither a complete, terminated
+        # uncommitted batch nor an unfinished tail fragment may be spliced
+        # into. A tail fragment is recover/audit-recognised garbage the
+        # next append would truncate away; refusing here keeps restore
+        # from appending (or truncating) anything before validation has
+        # fully passed, and forces the caller to commit, rollback, or
+        # repair explicitly.
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > self._valid_size:
+            raise WalPendingError(
+                "log is not settled at commit %r: %r pending record(s), "
+                "an unfinished tail fragment is present"
+                % (committed, pending_count)
+            )
+        current = candidate
+        target = {} if target_seq == 0 else dict(history_views)[target_seq]
+        # Merge the two key sets and write deterministically in Unicode
+        # (code point) key order. A key only in the target, or present
+        # with a different value under JSON-type-aware comparison, is a
+        # set; a key present now but absent in the target is a delete.
+        new_seq = committed + 1
+        for key in sorted(set(current) | set(target)):
+            if key not in target:
+                self._append({"op": "delete", "key": key, "seq": new_seq})
+            elif key not in current or not _json_equal(current[key], target[key]):
+                # Deep copy: the adopted value must not share objects with
+                # the replay's snapshot, which the caller could mutate.
+                self._append(
+                    {
+                        "op": "set",
+                        "key": key,
+                        "value": copy.deepcopy(target[key]),
+                        "seq": new_seq,
+                    }
+                )
+        self._append({"op": "commit", "seq": new_seq})
+        # Adopt the new committed view only once its commit boundary is
+        # durable, exactly as commit() does.
+        self.recover()
+        return self.commit_seq
 
     def _committed_view(self):
         # Replay the log purely into local objects, exactly like recovery, but

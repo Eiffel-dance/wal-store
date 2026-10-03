@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 import app
-from app import WalCorruptionError, WalStore
+from app import WalCorruptionError, WalPendingError, WalStore
 
 
 class RecoverTest(unittest.TestCase):
@@ -2241,6 +2241,7 @@ class ExclusiveLeaseTest(unittest.TestCase):
             lambda: s.delete("a"),
             lambda: s.commit(),
             lambda: s.rollback(),
+            lambda: s.restore(0),
             lambda: s.recover(),
             lambda: s.get("a"),
             lambda: s.contains("a"),
@@ -2339,6 +2340,322 @@ class ExclusiveLeaseTest(unittest.TestCase):
         self.assertEqual(s.state, {"a": 1})
         self.assertEqual(s.commit_seq, 1)
         s.close()
+
+
+class RestoreTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()  # 1: {a:1, b:{n:[1]}}
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()  # 2: {b:{n:[1]}, c:3}
+        s.commit()  # 3: empty commit, same state
+        return s
+
+    def test_restore_to_earlier_commit(self):
+        s = self.build()
+        new_seq = s.restore(1)
+        self.assertEqual(new_seq, 4)
+        self.assertEqual(s.commit_seq, 4)
+        self.assertEqual(s.state, {"a": 1, "b": {"n": [1]}})
+        self.assertEqual(s.recover()["pending_count"], 0)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq),
+                         ({"a": 1, "b": {"n": [1]}}, 4))
+        self.assertEqual(s.snapshot(),
+                         {"state": {"a": 1, "b": {"n": [1]}}, "commit_seq": 4})
+
+    def test_restore_keeps_old_history_and_snapshots(self):
+        s = self.build()
+        s.restore(1)
+        self.assertEqual(s.snapshot(1)["state"], {"a": 1, "b": {"n": [1]}})
+        self.assertEqual(s.snapshot(2)["state"], {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.snapshot(3)["state"], {"b": {"n": [1]}, "c": 3})
+        self.assertEqual([e["commit_seq"] for e in s.history()], [1, 2, 3, 4])
+        # batch 4 sets a and deletes c, in Unicode key order (a before c)
+        self.assertEqual(s.history()[-1]["changes"], [
+            {"op": "set", "key": "a", "value": 1},
+            {"op": "delete", "key": "c"},
+        ])
+
+    def test_restore_to_latest_writes_empty_batch_and_one_seq(self):
+        s = self.build()
+        size_before = self.path.stat().st_size
+        new_seq = s.restore(3)
+        self.assertEqual(new_seq, 4)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        added = self.path.read_bytes()[size_before:]
+        self.assertEqual(
+            added.decode(),
+            json.dumps({"op": "commit", "seq": 4}, sort_keys=True) + "\n",
+        )
+        self.assertEqual(s.history()[-1], {"commit_seq": 4, "changes": []})
+
+    def test_restore_zero_empties_state(self):
+        s = self.build()
+        new_seq = s.restore(0)
+        self.assertEqual(new_seq, 4)
+        self.assertEqual(s.state, {})
+        self.assertEqual(s.get("b", "missing"), "missing")
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({}, 4))
+        self.assertEqual(s.snapshot(2)["state"], {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.history()[-1]["changes"],
+                         [{"op": "delete", "key": "b"},
+                          {"op": "delete", "key": "c"}])
+
+    def test_restore_zero_on_empty_log_starts_seq_chain_at_one(self):
+        s = WalStore(self.path)
+        self.assertFalse(self.path.exists())
+        new_seq = s.restore(0)
+        self.assertEqual(new_seq, 1)
+        self.assertEqual((s.state, s.commit_seq), ({}, 1))
+        self.assertEqual(s.recover()["pending_count"], 0)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({}, 1))
+        self.assertEqual(
+            self.path.read_text(),
+            json.dumps({"op": "commit", "seq": 1}, sort_keys=True) + "\n",
+        )
+
+    def test_chained_restores(self):
+        s = self.build()
+        self.assertEqual(s.restore(1), 4)
+        self.assertEqual(s.state, {"a": 1, "b": {"n": [1]}})
+        self.assertEqual(s.restore(0), 5)
+        self.assertEqual(s.state, {})
+        self.assertEqual(s.restore(2), 6)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq),
+                         ({"b": {"n": [1]}, "c": 3}, 6))
+        self.assertEqual([e["commit_seq"] for e in s2.history()],
+                         [1, 2, 3, 4, 5, 6])
+
+    def test_invalid_target_seq_raises_valueerror(self):
+        s = self.build()
+        for bad in (True, False, -1, -10**9, 1.0, 1.5, "1", b"1", [1],
+                    None, {"s": 1}, object()):
+            with self.assertRaises(ValueError, msg=bad):
+                s.restore(bad)
+        with self.assertRaises(ValueError):
+            s.restore(4)  # beyond latest (3)
+        with self.assertRaises(ValueError):
+            s.restore(10**9)
+        self.assertEqual((s.state, s.commit_seq),
+                         ({"b": {"n": [1]}, "c": 3}, 3))
+
+    def test_value_error_on_empty_log_for_positive_target(self):
+        s = WalStore(self.path)
+        with self.assertRaises(ValueError):
+            s.restore(1)
+        self.assertFalse(self.path.exists())
+
+    def test_pending_records_raise_pending_error_without_change(self):
+        s = self.build()
+        s.set("z", 9)
+        s.delete("c")
+        before = self.path.read_bytes()
+        with self.assertRaises(WalPendingError):
+            s.restore(1)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq),
+                         ({"b": {"n": [1]}, "c": 3}, 3))
+        self.assertEqual(s.pending_changes()["pending_count"], 2)
+        self.assertEqual(s.rollback(), 2)
+        self.assertEqual(s.restore(1), 4)
+
+    def test_pending_records_before_any_commit_raise_pending_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        before = self.path.read_bytes()
+        with self.assertRaises(WalPendingError):
+            s.restore(0)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+
+    def test_tail_fragment_raises_pending_error(self):
+        s = self.build()
+        before = self.path.read_bytes()
+        fragments = [
+            '{"op": "set", "key": "x"',
+            "{",
+            '{"op": "commit", "seq": 4',
+            json.dumps({"op": "set", "key": "x", "value": 9, "seq": 4}),
+            '{"op": "set", "key": "hé'.encode("utf-8")[:-1],
+        ]
+        for frag in fragments:
+            raw = frag if isinstance(frag, bytes) else frag.encode("utf-8")
+            self.path.write_bytes(before)
+            self.append_bytes(raw)
+            size = self.path.stat().st_size
+            with self.assertRaises(WalPendingError, msg=frag):
+                s.restore(1)
+            self.assertEqual(self.path.stat().st_size, size, msg=frag)
+            self.assertEqual((s.state, s.commit_seq),
+                             ({"b": {"n": [1]}, "c": 3}, 3), msg=frag)
+        self.path.write_bytes(before)
+        self.append_bytes(fragments[0])
+        s.repair_tail()
+        self.assertEqual(s.restore(1), 4)
+
+    def test_corruption_raises_corruption_error_not_pending(self):
+        s = self.build()
+        prefix = self.path.read_bytes()
+        bad = b'{"op": "set", "key": "x"}\n'  # terminated but invalid
+        self.append_bytes(bad)
+        with self.assertRaises(WalCorruptionError):
+            s.restore(1)
+        self.assertEqual(self.path.read_bytes(), prefix + bad)
+        self.assertEqual((s.state, s.commit_seq),
+                         ({"b": {"n": [1]}, "c": 3}, 3))
+
+    def test_json_type_distinction_one_vs_true(self):
+        s = WalStore(self.path)
+        s.set("k", 1)
+        s.commit()  # 1: {k: 1}
+        s.set("k", True)
+        s.commit()  # 2: {k: true}
+        s.restore(1)
+        self.assertEqual(s.state, {"k": 1})
+        self.assertIs(s.get("k"), 1)
+        self.assertEqual(s.history()[-1]["changes"],
+                         [{"op": "set", "key": "k", "value": 1}])
+        s.restore(2)
+        self.assertIs(s.get("k"), True)
+        # nested distinction inside objects/arrays
+        s2 = WalStore(self.path.parent / "nested.wal")
+        s2.set("o", {"x": [1]})
+        s2.commit()
+        s2.set("o", {"x": [True]})
+        s2.commit()
+        s2.restore(1)
+        self.assertEqual(s2.get("o"), {"x": [1]})
+        self.assertEqual(s2.history()[-1]["changes"],
+                         [{"op": "set", "key": "o", "value": {"x": [1]}}])
+        # numerically equal int/float values compare as equal: empty batch
+        s3 = WalStore(self.path.parent / "nums.wal")
+        s3.set("n", 1)
+        s3.commit()
+        s3.set("n", 1.0)
+        s3.commit()
+        s3.restore(1)
+        self.assertEqual(s3.history()[-1]["changes"], [])
+
+    def test_unicode_key_order(self):
+        s = WalStore(self.path)
+        for k in ("z", "a", "中", "B", "é", "aa"):
+            s.set(k, 1)
+        s.commit()  # 1
+        s.restore(0)  # 2: deletes all, sorted by code point
+        keys = [c["key"] for c in s.history()[-1]["changes"]]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(keys, ["B", "a", "aa", "z", "é", "中"])
+
+    def test_state_is_independent_deep_copy(self):
+        s = self.build()
+        s.restore(1)
+        s.state["b"]["n"].append(99)
+        s.state["x"] = 5
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.state, {"a": 1, "b": {"n": [1]}})
+        self.assertEqual(s.snapshot(4)["state"], {"a": 1, "b": {"n": [1]}})
+        s3 = WalStore(self.path.parent / "iso.wal")
+        s3.set("a", {"v": [1]})
+        s3.commit()
+        target = s3.snapshot(1)
+        s3.commit()  # seq 2, same state
+        s3.restore(1)
+        target["state"]["a"]["v"].append(2)
+        self.assertEqual(s3.state, {"a": {"v": [1]}})
+
+    def test_oserror_mid_batch_propagates_and_keeps_committed_state(self):
+        s = self.build()  # seq 3
+        real_fsync = app.os.fsync
+        calls = {"n": 0}
+
+        def fail_after_first(fd):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk on fire")
+            return real_fsync(fd)
+
+        # restore(1) writes set a, delete c, then commit; the second
+        # record's fsync fails, so set a is left pending and retryable.
+        with mock.patch("app.os.fsync", side_effect=fail_after_first):
+            with self.assertRaises(OSError):
+                s.restore(1)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        pc = s.pending_changes()
+        self.assertEqual(pc.commit_seq, 3)
+        self.assertGreaterEqual(pc.pending_count, 1)
+        self.assertEqual(pc.changes[0],
+                         {"op": "set", "key": "a", "value": 1})
+        self.assertEqual(s.rollback(), pc.pending_count)
+        self.assertEqual(s.pending_changes()["pending_count"], 0)
+        self.assertEqual(s.restore(1), 4)
+        self.assertEqual(s.state, {"a": 1, "b": {"n": [1]}})
+
+    def test_oserror_on_commit_keeps_all_changes_pending(self):
+        s = self.build()  # restore(1) -> set a, delete c, commit
+        real_fsync = app.os.fsync
+        state = {"n": 0}
+
+        def third_fails(fd):
+            state["n"] += 1
+            if state["n"] >= 3:
+                raise OSError("disk on fire")
+            return real_fsync(fd)
+
+        with mock.patch("app.os.fsync", side_effect=third_fails):
+            with self.assertRaises(OSError):
+                s.restore(1)
+        self.assertEqual((s.state, s.commit_seq),
+                         ({"b": {"n": [1]}, "c": 3}, 3))
+        pc = s.pending_changes()
+        self.assertEqual(pc.pending_count, 2)
+        self.assertEqual(pc.changes, [
+            {"op": "set", "key": "a", "value": 1},
+            {"op": "delete", "key": "c"},
+        ])
+        # the surviving pending batch still reaches the target on commit
+        self.assertEqual(s.commit(), 4)
+        self.assertEqual(s.state, {"a": 1, "b": {"n": [1]}})
+
+    def test_exclusive_lease_covers_restore(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        self.assertEqual(s.restore(0), 2)
+        self.assertEqual((s.state, s.commit_seq), ({}, 2))
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({}, 2))
+        s.close()
+
+    def test_restored_value_is_an_independent_copy(self):
+        s = self.build()
+        s.restore(2)
+        got = s.get("b")
+        got["n"].append(2)
+        self.assertEqual(s.get("b"), {"n": [1]})
 
 
 if __name__ == "__main__":
