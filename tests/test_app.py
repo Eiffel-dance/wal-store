@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -2975,6 +2976,118 @@ class RestoreTest(unittest.TestCase):
         got = s.get("b")
         got["n"].append(2)
         self.assertEqual(s.get("b"), {"n": [1]})
+
+
+class ExclusiveLeaseAliasTest(unittest.TestCase):
+    """Aliases of the same actual log (symlinks, hard links, alternate
+    spellings) must compete for one exclusive lease, whether or not the
+    log already exists."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_symlink_alias_of_existing_log_shares_lease(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        alias = Path(self.dir.name) / "alias.wal"
+        os.symlink(self.path, alias)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(alias, exclusive=True)
+        # the holder is untouched and keeps writing
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s.close()
+        # once released, the alias can take the lease and sees the log
+        t = WalStore(alias, exclusive=True)
+        self.assertEqual((t.state, t.commit_seq), ({"a": 1, "b": 2}, 2))
+        t.close()
+
+    def test_hardlink_alias_of_existing_log_shares_lease(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        size = self.path.stat().st_size
+        alias = Path(self.dir.name) / "hard.wal"
+        os.link(self.path, alias)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(alias, exclusive=True)
+        # the conflicting open neither read nor modified the log
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s.close()
+        t = WalStore(alias, exclusive=True)
+        self.assertEqual((t.state, t.commit_seq), ({"a": 1}, 1))
+        t.close()
+
+    def test_symlinked_directory_alias_shares_lease(self):
+        realdir = Path(self.dir.name) / "real"
+        realdir.mkdir()
+        linkdir = Path(self.dir.name) / "linkdir"
+        os.symlink(realdir, linkdir)
+        s = WalStore(realdir / "store.wal", exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(linkdir / "store.wal", exclusive=True)
+        s.close()
+
+    def test_dangling_symlink_alias_of_missing_log_shares_lease(self):
+        # The log does not exist; the alias is a dangling symlink to it.
+        alias = Path(self.dir.name) / "alias.wal"
+        os.symlink(self.path, alias)
+        s = WalStore(alias, exclusive=True)
+        # exactly one of the aliases holds the lease; the log is not created
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        self.assertFalse(self.path.exists())
+        # the winner creates the log through the alias; the loser stays busy
+        s.set("a", 1)
+        s.commit()
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s.close()
+        r = WalStore(self.path)
+        self.assertEqual((r.state, r.commit_seq), ({"a": 1}, 1))
+        r.close()
+
+    def test_hardlink_alias_made_after_creation_still_conflicts(self):
+        s = WalStore(self.path, exclusive=True)  # log missing at open
+        s.set("a", 1)
+        s.commit()  # the lease holder creates the log
+        alias = Path(self.dir.name) / "hard.wal"
+        os.link(self.path, alias)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(alias, exclusive=True)
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s.close()
+        self.assertEqual(WalStore(alias).state, {"a": 1, "b": 2})
+
+    def test_distinct_missing_logs_do_not_conflict(self):
+        other = Path(self.dir.name) / "other.wal"
+        s = WalStore(self.path, exclusive=True)
+        t = WalStore(other, exclusive=True)  # different target: no conflict
+        s.close()
+        t.close()
+
+    def test_alias_conflict_leaves_no_lease_behind(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        alias = Path(self.dir.name) / "alias.wal"
+        os.symlink(self.path, alias)
+        for _ in range(2):
+            with self.assertRaises(app.WalBusyError):
+                WalStore(alias, exclusive=True)
+        s.close()
+        # failed attempts held nothing: the alias acquires immediately
+        t = WalStore(alias, exclusive=True)
+        t.close()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ class WalCorruptionError(ValueError):
 
 
 class WalBusyError(Exception):
-    """Raised when an exclusive write lease is already held for the log path."""
+    """Raised when an exclusive write lease is already held for the log."""
 
 
 class WalClosedError(Exception):
@@ -226,29 +226,81 @@ class WalStore:
         self._closed = False
         self._readonly = readonly
         self._lock_fd = None
+        self._log_lock_fd = None
         if exclusive:
             # The lease is taken before the log is ever read: a conflicting
             # open raises WalBusyError without creating, truncating, or
-            # appending to the log. A read-only instance never takes it and
-            # may open a path leased by a live exclusive writer.
+            # appending to the log. Alias resolution (symlinks, hard links,
+            # alternate spellings of the same log) happens here too, after
+            # parameter validation and before any WAL content is read. A
+            # read-only instance never takes it and may open a path leased
+            # by a live exclusive writer.
             self._acquire_lease()
         self.recover()
 
     def _acquire_lease(self):
-        """Take the exclusive write lease for this store's log path.
+        """Take the exclusive write lease for this store's log.
 
-        The lease is an flock on a sibling lock file derived from the
-        normalized absolute log path, so every spelling of the same path
-        competes for the same lease and lease management never creates,
-        truncates, or appends to the log itself. flock locks are held per
-        open file description, so two exclusive instances conflict even
-        within one process, and the kernel releases the lock when the
-        holder's descriptor dies -- a crashed process can never leave the
-        lease blocked, and the leftover lock file holds no lock.
+        The lease identity is the log object itself, not one spelling of
+        its path, so two locks cooperate:
+
+        * a sibling lock file derived from the canonical path -- realpath
+          resolves ".." and every symlink component, including a dangling
+          final symlink, so every spelling and symlink alias of the same
+          target competes for the same lock file. A not-yet-created log
+          is still serialised through it: of concurrent first opens of
+          aliases of the same target exactly one wins, and lease
+          management never creates, truncates, or appends to the log.
+        * a non-blocking flock on the log's own inode when it already
+          exists (opened O_RDONLY): hard-link aliases share the same
+          (device, inode), so they conflict even though no path
+          canonicalisation could ever merge them.
+
+        Both locks are held per open file description, so two exclusive
+        instances conflict even within one process, and the kernel
+        releases them when the holder's descriptor dies -- a crashed
+        process can never leave the lease blocked, and leftover lock
+        files hold no lock. A conflicting open raises WalBusyError before
+        the log is read and without creating, truncating, or appending to
+        it; a read-only instance never takes either lock.
         """
-        lock_path = os.path.abspath(os.fspath(self.path)) + ".lock"
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        abs_path = os.path.abspath(os.fspath(self.path))
+        lock_path = os.path.realpath(abs_path) + ".lock"
+        log_fd = self._open_log_for_lease(abs_path)
+        try:
+            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                os.close(fd)
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    raise WalBusyError(
+                        "log path is exclusively leased: %r" % (str(self.path),)
+                    ) from None
+                raise
+        except BaseException:
+            # Never leave the inode lock held when the side lock cannot be
+            # taken; the conflict (or failure) must not leak a lease.
+            if log_fd is not None:
+                self._release_fd(log_fd)
+            raise
+        self._lock_fd = fd
+        self._log_lock_fd = log_fd
+
+    def _open_log_for_lease(self, abs_path):
+        """Flock the existing log's inode for the lease, or return None.
+
+        None means the log does not exist yet; the side lock file alone
+        then serialises the first creation. The log is opened O_RDONLY --
+        never created, truncated, or appended to. A busy inode raises
+        WalBusyError; any other failure of the underlying file operations
+        propagates as the corresponding OSError.
+        """
+        try:
+            fd = os.open(abs_path, os.O_RDONLY)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -258,7 +310,30 @@ class WalStore:
                     "log path is exclusively leased: %r" % (str(self.path),)
                 ) from None
             raise
-        self._lock_fd = fd
+        return fd
+
+    def _ensure_inode_lease(self):
+        """Extend the held lease to the log's inode once the log exists.
+
+        The lease is taken before the log is ever read, so a log created
+        only afterwards -- by this store's own first append -- was not
+        locked at open time. From the moment the inode exists it must be
+        locked as well, or a hard-link alias made later could take a
+        second exclusive lease through its own canonical lock file.
+        """
+        if self._lock_fd is None or self._log_lock_fd is not None:
+            return
+        self._log_lock_fd = self._open_log_for_lease(
+            os.path.abspath(os.fspath(self.path))
+        )
+
+    @staticmethod
+    def _release_fd(fd):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
     def close(self):
         """Release the write lease (if any) and close the store.
@@ -270,14 +345,14 @@ class WalStore:
         if self._closed:
             return
         self._closed = True
+        log_fd = self._log_lock_fd
+        self._log_lock_fd = None
+        if log_fd is not None:
+            self._release_fd(log_fd)
         fd = self._lock_fd
         self._lock_fd = None
         if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+            self._release_fd(fd)
 
     def __enter__(self):
         self._check_open()
@@ -331,6 +406,10 @@ class WalStore:
         un-durable tail is best-effort truncated back so a failed write can
         never masquerade as a committed record on reopen.
         """
+        # If this store holds the lease and the log has come into existence
+        # since the lease was taken, the inode lock must be in place before
+        # any further write.
+        self._ensure_inode_lease()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row, sort_keys=True) + "\n"
         self._drop_tail_fragment()
@@ -354,6 +433,9 @@ class WalStore:
             self._valid_size = f.tell()
         if created:
             self._fsync_parent_dir()
+            # The log inode now exists; the lease must cover it from this
+            # moment so a later hard-link alias cannot take a second lease.
+            self._ensure_inode_lease()
 
     def _fsync_parent_dir(self):
         """Best-effort persistence of a freshly created log file's directory entry."""
