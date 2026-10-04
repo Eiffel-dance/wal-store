@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -2340,6 +2341,325 @@ class ExclusiveLeaseTest(unittest.TestCase):
         self.assertEqual(s.state, {"a": 1})
         self.assertEqual(s.commit_seq, 1)
         s.close()
+
+
+class AliasLeaseTest(unittest.TestCase):
+    """Single-writer lease must follow the real log object, not the path.
+
+    Symlink chains, hard links, and other path aliases that name one actual
+    log file all compete for the same exclusive lease; aliases of a log that
+    does not exist yet are serialized so concurrent first opens still elect
+    exactly one writer.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def build_committed(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        return s
+
+    # ----- existing log: every alias of one inode shares the lease -----
+
+    def test_symlink_alias_is_busy_in_both_directions(self):
+        s = self.build_committed()
+        link = self.path.parent / "by-link.wal"
+        os.symlink(self.path, link)
+        # holder reached via the real path, contender via the symlink
+        with self.assertRaises(app.WalBusyError):
+            WalStore(link, exclusive=True)
+        s.close()
+        # holder reached via the symlink, contender via the real path
+        s2 = WalStore(link, exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        s2.close()
+
+    def test_hardlink_alias_is_busy(self):
+        s = self.build_committed()
+        hard = self.path.parent / "by-hardlink.wal"
+        os.link(self.path, hard)
+        self.assertEqual(os.stat(hard).st_ino, os.stat(self.path).st_ino)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(hard, exclusive=True)
+        s.close()
+        # after release the hard link leases the same object and recovers it
+        s2 = WalStore(hard, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        s2.close()
+
+    def test_alias_through_linked_directory_is_busy(self):
+        real_dir = self.path.parent / "realdata"
+        real_dir.mkdir()
+        inside = real_dir / "store.wal"
+        s = WalStore(inside, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        link_dir = self.path.parent / "linkdata"
+        os.symlink(real_dir, link_dir)
+        alias = link_dir / "store.wal"
+        with self.assertRaises(app.WalBusyError):
+            WalStore(alias, exclusive=True)
+        s.close()
+        s2 = WalStore(alias, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        s2.close()
+
+    def test_normalized_dotted_alias_of_existing_log_is_busy(self):
+        s = self.build_committed()
+        dotted = self.path.parent / "sub" / ".." / "store.wal"
+        with self.assertRaises(app.WalBusyError):
+            WalStore(dotted, exclusive=True)
+        s.close()
+
+    def test_distinct_logs_do_not_share_a_lease(self):
+        other = self.path.parent / "other.wal"
+        s1 = WalStore(self.path, exclusive=True)
+        s2 = WalStore(other, exclusive=True)
+        s1.set("a", 1)
+        s2.set("b", 2)
+        self.assertEqual(s1.commit(), 1)
+        self.assertEqual(s2.commit(), 1)
+        s1.close()
+        s2.close()
+
+    def test_symlinks_to_distinct_targets_stay_independent(self):
+        other = self.path.parent / "other.wal"
+        link_a = self.path.parent / "link-a.wal"
+        link_b = self.path.parent / "link-b.wal"
+        os.symlink(self.path, link_a)
+        os.symlink(other, link_b)
+        s1 = WalStore(self.path, exclusive=True)
+        s2 = WalStore(link_b, exclusive=True)  # different real object
+        s1.set("a", 1)
+        s2.set("b", 2)
+        self.assertEqual(s1.commit(), 1)
+        self.assertEqual(s2.commit(), 1)
+        # each alias conflicts only with its own object
+        with self.assertRaises(app.WalBusyError):
+            WalStore(link_a, exclusive=True)
+        s1.close()
+        s2.close()
+
+    def test_busy_via_alias_never_reads_or_touches_the_log(self):
+        s = self.build_committed()
+        link = self.path.parent / "by-link.wal"
+        os.symlink(self.path, link)
+        # append corruption the loser would reject *if it read the log*;
+        # the lease conflict must win before recovery runs
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("not-a-record\n")
+        size = self.path.stat().st_size
+        for _ in range(2):
+            with self.assertRaises(app.WalBusyError):
+                WalStore(link, exclusive=True)
+        self.assertEqual(self.path.stat().st_size, size)
+        # holder keeps its own lease, state, seq, and file bytes
+        self.assertEqual(s.state, {"a": 1})
+        self.assertEqual(s.commit_seq, 1)
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s.close()
+
+    def test_alias_close_and_context_manager_release_identity_lease(self):
+        self.build_committed().close()
+        link = self.path.parent / "by-link.wal"
+        os.symlink(self.path, link)
+        with WalStore(link, exclusive=True) as s:
+            self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+            with self.assertRaises(app.WalBusyError):
+                WalStore(self.path, exclusive=True)
+        # released: the real path leases the same object again
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        s2.close()
+
+    # ----- missing log: aliases converge on one real target -----
+
+    def test_dangling_symlink_to_missing_log_elects_one_writer(self):
+        link = self.path.parent / "future-link.wal"
+        os.symlink(self.path, link)  # target does not exist yet
+        winner = WalStore(self.path, exclusive=True)
+        # the dangling alias names the same not-yet-created target
+        with self.assertRaises(app.WalBusyError):
+            WalStore(link, exclusive=True)
+        # winner goes on to create the log; loser still cannot enter
+        winner.set("x", 9)
+        self.assertEqual(winner.commit(), 1)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(link, exclusive=True)
+        # the winner's create resolved the formerly dangling symlink target
+        self.assertTrue(self.path.exists())
+        winner.close()
+        # once released the alias reaches the object the winner created
+        s2 = WalStore(link, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"x": 9}, 1))
+        s2.close()
+
+    def test_reverse_dangling_symlink_winner(self):
+        link = self.path.parent / "future-link.wal"
+        os.symlink(self.path, link)
+        # winner enters through the symlink spelling; contender uses the
+        # concrete path -- still exactly one lease for the future object
+        winner = WalStore(link, exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        winner.set("k", 7)
+        self.assertEqual(winner.commit(), 1)
+        winner.close()
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"k": 7}, 1))
+        s2.close()
+
+    def test_concurrent_first_open_threads_leave_single_writer(self):
+        import threading
+
+        link = self.path.parent / "future-link.wal"
+        os.symlink(self.path, link)
+        results = {}
+
+        def attempt(name, target):
+            try:
+                results[name] = ("open", WalStore(target, exclusive=True))
+            except app.WalBusyError:
+                results[name] = ("busy", None)
+            except Exception as exc:  # pragma: no cover - surfaced as failure
+                results[name] = ("other", exc)
+
+        t1 = threading.Thread(target=attempt, args=("one", self.path))
+        t2 = threading.Thread(target=attempt, args=("two", link))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        statuses = sorted(name for name, (kind, _) in results.items())
+        kinds = [results[n][0] for n in statuses]
+        self.assertEqual(sorted(kinds), ["busy", "open"])
+        winner_name = [n for n in statuses if results[n][0] == "open"][0]
+        winner = results[winner_name][1]
+        winner.set("v", 1)
+        self.assertEqual(winner.commit(), 1)
+        # while the winner is live, opening the *other* alias still fails
+        other_target = link if winner_name == "one" else self.path
+        with self.assertRaises(app.WalBusyError):
+            WalStore(other_target, exclusive=True)
+        winner.close()
+
+    def test_winner_that_never_creates_releases_gate_on_close(self):
+        link = self.path.parent / "future-link.wal"
+        os.symlink(self.path, link)
+        first = WalStore(self.path, exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(link, exclusive=True)
+        first.close()  # never wrote: no log was created, gate must be freed
+        self.assertFalse(self.path.exists())
+        second = WalStore(link, exclusive=True)
+        second.set("y", 3)
+        self.assertEqual(second.commit(), 1)
+        second.close()
+        self.assertEqual(WalStore(self.path).state, {"y": 3})
+
+    def test_dotted_alias_through_existing_directory_converges(self):
+        # a lexical "sub/.." spelling only names the same file once sub
+        # physically exists; with it present both spellings are one target
+        real = self.path.parent / "data"
+        (real / "sub").mkdir(parents=True)
+        a = real / "store.wal"
+        b = real / "sub" / ".." / "store.wal"
+        first = WalStore(a, exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(b, exclusive=True)
+        first.set("d", 1)
+        self.assertEqual(first.commit(), 1)
+        first.close()
+        second = WalStore(b, exclusive=True)
+        self.assertEqual((second.state, second.commit_seq), ({"d": 1}, 1))
+        second.close()
+
+    # ----- identity resolution / IO failure error semantics -----
+
+    def test_unresolvable_symlink_loop_raises_oserror_not_busy(self):
+        loop = self.path.parent / "loop.wal"
+        os.symlink(loop, loop)
+        with self.assertRaises(OSError):
+            WalStore(loop, exclusive=True)
+        # and it must not be misreported as a lease conflict
+        with self.assertRaises(OSError) as cm:
+            WalStore(loop, exclusive=True)
+        self.assertNotIsInstance(cm.exception, app.WalBusyError)
+
+    def test_identity_swap_after_unlink_aborts_write_with_oserror(self):
+        s = self.build_committed()
+        s.close()
+        holder = WalStore(self.path, exclusive=True)
+        leased = (holder._leased_dev, holder._leased_ino)
+        # replace the path with a brand-new object behind the holder's back
+        os.unlink(self.path)
+        with self.path.open("w", encoding="utf-8") as f:
+            f.write("")
+        self.assertNotEqual(
+            (os.stat(self.path).st_dev, os.stat(self.path).st_ino), leased
+        )
+        with self.assertRaises(OSError):
+            holder.set("rogue", 1)
+        holder.close()
+
+    def test_non_exclusive_and_readonly_aliases_unaffected(self):
+        s = self.build_committed()
+        link = self.path.parent / "by-link.wal"
+        os.symlink(self.path, link)
+        plain = WalStore(link)  # no lease: reads alongside the writer
+        reader = WalStore(link, readonly=True)
+        self.assertEqual((plain.state, plain.commit_seq), ({"a": 1}, 1))
+        self.assertEqual((reader.state, reader.commit_seq), ({"a": 1}, 1))
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(plain.get("b"), 2)
+        self.assertEqual(reader.get("b"), 2)
+        plain.close()
+        reader.close()
+        s.close()
+
+    def test_alias_lease_survives_holder_crash_cross_process(self):
+        import subprocess
+        import sys
+
+        self.build_committed().close()
+        link = self.path.parent / "by-link.wal"
+        os.symlink(self.path, link)
+        code = (
+            "import sys; sys.path.insert(0, %r);"
+            "from app import WalStore;"
+            "s = WalStore(%r, exclusive=True);"
+            "s.set('c', 3); s.commit();"
+            "print('ready', flush=True);"
+            "import time; time.sleep(60)"
+            % (str(Path(app.__file__).parent), str(link))
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertEqual(proc.stdout.readline().strip(), b"ready")
+            # the live holder reached the object through the symlink; a
+            # contender using the concrete path must still be refused
+            with self.assertRaises(app.WalBusyError):
+                WalStore(self.path, exclusive=True)
+        finally:
+            proc.kill()
+            proc.wait()
+        # abnormal termination releases the identity lease kernel-side
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "c": 3}, 2))
+        s2.close()
 
 
 class ReadOnlyModeTest(unittest.TestCase):

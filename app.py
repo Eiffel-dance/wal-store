@@ -1,9 +1,11 @@
 import copy
 import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -199,6 +201,13 @@ def _reject_duplicate_keys(pairs):
     return dict(pairs)
 
 
+# Side-channel directory for the identity-based lease locks. It never holds
+# WAL bytes: per-real-object locks are named by device and inode, and the
+# concurrent-first-open interlock locks by the canonical target path. It is
+# shared by every spelling (symlink, hard link, or normalized alias) of a log.
+_LOCK_DIR = os.path.join(tempfile.gettempdir(), "walstore_locks")
+
+
 class WalStore:
     def __init__(self, path, exclusive=False, readonly=False):
         # Validate every parameter before touching the path in any way: a
@@ -225,7 +234,20 @@ class WalStore:
         self._valid_size = None
         self._closed = False
         self._readonly = readonly
+        # Legacy per-normalized-path lease descriptor (kept for the exact
+        # historical sibling-lock behaviour) plus the real-object identity
+        # lease descriptors:
+        #   _identity_fd  flock on a file named by the log's (dev, ino)
+        #   _gate_fd      serializes concurrent first creation of a missing log
+        #   _pin_fd       open descriptor on the leased object, anchoring its
+        #                 identity for the lifetime of the lease
+        # _leased_dev/_leased_ino record the one real object under lease.
         self._lock_fd = None
+        self._identity_fd = None
+        self._gate_fd = None
+        self._pin_fd = None
+        self._leased_dev = None
+        self._leased_ino = None
         if exclusive:
             # The lease is taken before the log is ever read: a conflicting
             # open raises WalBusyError without creating, truncating, or
@@ -234,19 +256,19 @@ class WalStore:
             self._acquire_lease()
         self.recover()
 
-    def _acquire_lease(self):
-        """Take the exclusive write lease for this store's log path.
+    @staticmethod
+    def _busy_error(path):
+        return WalBusyError(
+            "log path is exclusively leased: %r" % (str(path),)
+        )
 
-        The lease is an flock on a sibling lock file derived from the
-        normalized absolute log path, so every spelling of the same path
-        competes for the same lease and lease management never creates,
-        truncates, or appends to the log itself. flock locks are held per
-        open file description, so two exclusive instances conflict even
-        within one process, and the kernel releases the lock when the
-        holder's descriptor dies -- a crashed process can never leave the
-        lease blocked, and the leftover lock file holds no lock.
+    def _take_flock(self, lock_path):
+        """Open ``lock_path`` and take a non-blocking exclusive flock.
+
+        Returns the held descriptor. A lock already held by another open
+        file description maps to WalBusyError; every other filesystem
+        failure (including an unresolvable lock location) stays an OSError.
         """
-        lock_path = os.path.abspath(os.fspath(self.path)) + ".lock"
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
@@ -254,11 +276,224 @@ class WalStore:
         except OSError as exc:
             os.close(fd)
             if exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise WalBusyError(
-                    "log path is exclusively leased: %r" % (str(self.path),)
-                ) from None
+                raise self._busy_error(self.path) from None
             raise
-        self._lock_fd = fd
+        return fd
+
+    def _identity_stat(self):
+        """Identity of the log's real object, following every symlink.
+
+        Returns (st_dev, st_ino), or None when no object (not even a
+        dangling symlink) sits at the path. Hard links to one inode resolve
+        identically; distinct symlink chains reaching one file resolve
+        identically. Only metadata is read, never WAL content. Any other
+        stat failure propagates as OSError.
+        """
+        try:
+            st = os.stat(os.fspath(self.path))
+        except FileNotFoundError:
+            return None
+        return (st.st_dev, st.st_ino)
+
+    @staticmethod
+    def _identity_lock_path(dev, ino):
+        digest = hashlib.sha256(
+            ("dev=%d:ino=%d" % (dev, ino)).encode("ascii")
+        ).hexdigest()
+        return os.path.join(_LOCK_DIR, "ino-" + digest + ".lock")
+
+    def _canonical_missing_target(self):
+        """Deterministic path naming a log that does not exist yet.
+
+        The longest existing ancestor is resolved through symlinks (so
+        aliases converging on one missing target agree), and the remaining
+        non-existent components -- including the target of a dangling
+        symlink -- are appended verbatim. The result only names a lock; it
+        never creates the log.
+        """
+        cur = os.path.abspath(os.fspath(self.path))
+        missing_parts = []
+        while not os.path.lexists(cur):
+            missing_parts.append(os.path.basename(cur))
+            parent = os.path.dirname(cur)
+            if parent == cur:  # filesystem root
+                break
+            cur = parent
+        # realpath follows symlinks in the existing prefix (and a dangling
+        # terminal link) without requiring the final target to exist.
+        base = os.path.realpath(cur)
+        if missing_parts:
+            return os.path.join(base, *reversed(missing_parts))
+        return base
+
+    def _create_gate_lock_path(self):
+        target = self._canonical_missing_target()
+        digest = hashlib.sha256(target.encode("utf-8")).hexdigest()
+        return os.path.join(_LOCK_DIR, "new-" + digest + ".lock")
+
+    def _lock_identity(self, dev, ino):
+        """Take the per-real-object flock for (dev, ino)."""
+        fd = self._take_flock(self._identity_lock_path(dev, ino))
+        self._identity_fd = fd
+        self._leased_dev = dev
+        self._leased_ino = ino
+
+    def _pin_object(self):
+        """Open and pin the leased object, asserting its identity matches."""
+        fd = os.open(os.fspath(self.path), os.O_RDONLY)
+        try:
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) != (self._leased_dev, self._leased_ino):
+                raise OSError(
+                    errno.ESTALE,
+                    "wal object identity changed under the exclusive lease: %r"
+                    % (str(self.path),),
+                )
+        except OSError:
+            os.close(fd)
+            raise
+        self._pin_fd = fd
+
+    def _acquire_lease(self):
+        """Take the exclusive write lease for this store's real log object.
+
+        The lease has three cooperating flocks, all held per open file
+        description so two exclusive instances conflict even within one
+        process, and all released by the kernel when the holder dies:
+
+        * a legacy sibling lock derived from the normalized absolute path,
+          preserving the original same-spelling mutual exclusion;
+        * an identity lock named by the real object's (st_dev, st_ino), so
+          symlink and hard-link aliases of one existing log compete for the
+          very same lease instead of each getting its own path lock;
+        * for a log that does not exist yet, a creation gate named by the
+          canonical target path that serializes concurrent first opens
+          across aliases. After acquiring it the path is re-resolved: the
+          first opener creates the log and adopts its inode lock, while any
+          alias opener that finds the object already there -- or created by
+          the first opener -- takes (or loses on) the inode lock.
+
+        Nothing here reads, creates, truncates, or appends WAL bytes; only
+        metadata and side-channel lock files in a shared lock directory are
+        touched. A conflict raises WalBusyError; an unresolvable identity or
+        failing file operation propagates the underlying OSError.
+        """
+        # 1. Legacy per-path sibling lock: unchanged path, message, and
+        # mutual exclusion for identical normalized spellings.
+        self._lock_fd = self._take_flock(
+            os.path.abspath(os.fspath(self.path)) + ".lock"
+        )
+        try:
+            identity = self._identity_stat()
+            if identity is not None:
+                # 2a. Existing real object: one lease per (device, inode).
+                self._lock_identity(*identity)
+                self._pin_object()
+                return
+            # 2b. The log does not exist yet: serialize concurrent first
+            # creation across every alias of the same target, then resolve
+            # the real object the winner is about to bring into existence.
+            self._gate_fd = self._take_flock(self._create_gate_lock_path())
+            identity = self._identity_stat()
+            if identity is not None:
+                # A racing alias opener (same gate) created it first; compete
+                # for the identity lock like any existing-object opener.
+                self._lock_identity(*identity)
+                self._pin_object()
+            # else: this opener won the gate and owns the first create. The
+            # (dev, ino) identity lock is adopted atomically in _append once
+            # the log file is actually created; the gate is held until then.
+        except BaseException:
+            self._release_lease_fds()
+            raise
+
+    def _release_lease_fds(self):
+        """Release every lease-side descriptor; tolerant of partial opens."""
+        fd = self._lock_fd
+        self._lock_fd = None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        fd = self._identity_fd
+        self._identity_fd = None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        fd = self._gate_fd
+        self._gate_fd = None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        fd = self._pin_fd
+        self._pin_fd = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._leased_dev = None
+        self._leased_ino = None
+
+    def _adopt_created_identity(self, write_fd):
+        """Adopt the inode lock for a log the gate winner just created.
+
+        Runs while the creation gate is still held: no alias opener can have
+        slipped past its own gate, so the fresh inode cannot already be
+        leased. The object is pinned before the gate is dropped.
+        """
+        st = os.fstat(write_fd.fileno())
+        dev, ino = st.st_dev, st.st_ino
+        fd = self._take_flock(self._identity_lock_path(dev, ino))
+        self._identity_fd = fd
+        self._leased_dev = dev
+        self._leased_ino = ino
+        # Pin via an independent descriptor (write_fd closes at _append's
+        # end) before releasing the creation gate.
+        self._pin_object()
+        gate = self._gate_fd
+        self._gate_fd = None
+        if gate is not None:
+            try:
+                fcntl.flock(gate, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(gate)
+
+    def _verify_leased_object(self, f):
+        """Guard every write-mode WAL open against an identity swap.
+
+        An exclusive store only ever mutates the exact (dev, ino) it leased;
+        if the path was replaced (unlinked and re-created as another object
+        through an alias) the write aborts with OSError rather than touching
+        a log this instance never leased. Non-exclusive stores are unaffected.
+        """
+        if self._leased_dev is None:
+            return
+        st = os.fstat(f.fileno())
+        if (st.st_dev, st.st_ino) != (self._leased_dev, self._leased_ino):
+            raise OSError(
+                errno.ESTALE,
+                "wal object identity changed under the exclusive lease: %r"
+                % (str(self.path),),
+            )
 
     def close(self):
         """Release the write lease (if any) and close the store.
@@ -270,14 +505,7 @@ class WalStore:
         if self._closed:
             return
         self._closed = True
-        fd = self._lock_fd
-        self._lock_fd = None
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
+        self._release_lease_fds()
 
     def __enter__(self):
         self._check_open()
@@ -320,9 +548,25 @@ class WalStore:
         if self.path.stat().st_size <= self._valid_size:
             return
         with self.path.open("r+b") as f:
+            self._authorize_write_handle(f)
             f.truncate(self._valid_size)
             f.flush()
             os.fsync(f.fileno())
+
+    def _authorize_write_handle(self, f):
+        """Pin every write-mode WAL handle to the leased real object.
+
+        If the creation gate is still held (the log did not exist when this
+        exclusive store opened), opening for write is the first-create
+        moment: adopt that object's inode lease then. Otherwise the handle
+        must target the exact (dev, ino) the store leased; an identity swap
+        aborts with OSError. Non-exclusive stores hold neither and are
+        untouched.
+        """
+        if self._gate_fd is not None and self._identity_fd is None:
+            self._adopt_created_identity(f)
+        else:
+            self._verify_leased_object(f)
 
     def _append(self, row):
         """Durably append one log record.
@@ -336,6 +580,7 @@ class WalStore:
         self._drop_tail_fragment()
         created = not self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
+            self._authorize_write_handle(f)
             saved_size = f.tell()
             try:
                 f.write(line)
@@ -422,6 +667,7 @@ class WalStore:
         # never masquerade as a successful rollback. state and commit_seq are
         # not touched: they already equal the last committed view.
         with self.path.open("r+b") as f:
+            self._authorize_write_handle(f)
             f.truncate(committed_size)
             f.flush()
             os.fsync(f.fileno())
@@ -820,6 +1066,7 @@ class WalStore:
         # propagate -- a failed repair must never masquerade as success --
         # and adopt the replayed view only once the truncation is durable.
         with self.path.open("r+b") as f:
+            self._authorize_write_handle(f)
             f.truncate(valid_size)
             f.flush()
             os.fsync(f.fileno())
