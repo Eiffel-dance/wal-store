@@ -26,12 +26,22 @@ class WalReadOnlyError(Exception):
 
 
 class WalPendingError(Exception):
-    """Raised by restore() when the log is not settled at the last commit.
+    """Raised by restore()/apply_batch() when the log is not settled.
 
     Either complete, terminated set/delete records wait in an uncommitted
     batch, or an interrupted write leaves an unfinished tail fragment.
-    restore() never splices a new batch into either state; the caller must
+    Neither entry splices a new batch into either state; the caller must
     commit or roll the pending records back (or repair the fragment) first.
+    """
+
+
+class WalConflictError(Exception):
+    """Raised by apply_batch() when the declared base seq is stale.
+
+    The caller-declared base commit seq does not match the log's latest
+    committed seq, so the batch's compare-and-swap precondition fails.
+    Nothing is written, truncated, or adopted; the caller is expected to
+    re-read the current state and retry with the up-to-date base.
     """
 
 
@@ -753,6 +763,143 @@ class WalStore:
                         "seq": new_seq,
                     }
                 )
+        self._append({"op": "commit", "seq": new_seq})
+        # Adopt the new committed view only once its commit boundary is
+        # durable, exactly as commit() does.
+        self.recover()
+        return self.commit_seq
+
+    def apply_batch(self, base_seq, changes):
+        """Atomically commit an ordered batch of set/delete changes.
+
+        Every change is appended to the log first, in the caller's order,
+        and the batch is sealed by one new commit record whose seq is the
+        latest committed seq + 1 -- exactly as if the caller had issued the
+        same set/delete records one at a time and then committed. Returns
+        the new commit_seq. An empty changes collection is an empty commit:
+        no change records, one commit record, seq advancing by one.
+
+        base_seq is the caller-declared compare-and-swap precondition: it
+        must be a non-boolean non-negative integer and must equal the log's
+        latest committed seq, otherwise the call raises ValueError or the
+        unique WalConflictError respectively. Each change must be a dict
+        carrying exactly the existing record semantics -- {"op": "set",
+        "key", "value"} or {"op": "delete", "key"} -- with a string key and
+        a value under the existing JSON-compatibility rules; any other
+        shape raises ValueError. All argument validation completes before
+        the log is touched.
+
+        The log is then validated under the exact recover rules (any
+        corruption raises WalCorruptionError) and must be settled at the
+        last commit: complete uncommitted set/delete records or a
+        recover/audit-recognisable unfinished tail fragment raise
+        WalPendingError. None of these rejections writes, truncates, or
+        alters in-memory state. A read-only instance raises
+        WalReadOnlyError and a closed one WalClosedError before any of the
+        above, exactly as the other mutating entries do.
+
+        The write phase follows the same single-writer lease, per-record
+        flush+fsync, and seq monotonicity rules as set/delete/commit: an
+        OSError from any change record or the final commit propagates
+        unchanged, the already-durable prefix stays observable through
+        pending_changes and removable through rollback, and neither the
+        in-memory state nor commit_seq advances. A process terminated at
+        any write boundary recovers to the last complete commit on reopen;
+        the unsealed part of the batch is never applied. Values are
+        deep-copied into the written records, so neither the caller's
+        changes collection nor the returned seq shares mutable nested
+        objects with the store.
+        """
+        self._check_writable()
+        if (
+            isinstance(base_seq, bool)
+            or not isinstance(base_seq, int)
+            or base_seq < 0
+        ):
+            raise ValueError(
+                "base_seq must be a non-negative integer, got %r" % (base_seq,)
+            )
+        if not isinstance(changes, (list, tuple)):
+            raise ValueError(
+                "changes must be a list of change records, got %r"
+                % (type(changes).__name__,)
+            )
+        # Validate and normalize every change up front: a rejected call
+        # must never create, truncate, or append to the log or alter
+        # in-memory state. Values are deep-copied so the written records
+        # can never share mutable nested objects with the caller's
+        # collection.
+        normalized = []
+        for index, change in enumerate(changes):
+            if not isinstance(change, dict):
+                raise ValueError(
+                    "change %r must be a dict, got %r"
+                    % (index, type(change).__name__)
+                )
+            op = change.get("op")
+            if op == "set":
+                if set(change) != {"op", "key", "value"}:
+                    raise ValueError(
+                        "set change %r must carry exactly op, key and value, "
+                        "got %r" % (index, sorted(change))
+                    )
+                _validate_key(change["key"])
+                _validate_value(change["value"])
+                normalized.append(
+                    {
+                        "op": "set",
+                        "key": change["key"],
+                        "value": copy.deepcopy(change["value"]),
+                    }
+                )
+            elif op == "delete":
+                if set(change) != {"op", "key"}:
+                    raise ValueError(
+                        "delete change %r must carry exactly op and key, "
+                        "got %r" % (index, sorted(change))
+                    )
+                _validate_key(change["key"])
+                normalized.append({"op": "delete", "key": change["key"]})
+            else:
+                raise ValueError(
+                    "change %r has unknown op %r: only 'set' and 'delete' "
+                    "records may be batched" % (index, op)
+                )
+        # Full recover-rule validation of the log, purely into local
+        # objects: corruption raises WalCorruptionError before anything is
+        # written, truncated, or adopted.
+        (
+            _candidate,
+            committed,
+            pending_count,
+            _valid_size,
+            _committed_size,
+        ) = self._replay()
+        # The log must be settled at the last commit before a new batch is
+        # spliced on: neither complete uncommitted records nor a
+        # recognisable unfinished tail fragment may be present (same rule
+        # as restore).
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > self._valid_size:
+            raise WalPendingError(
+                "log is not settled at commit %r: %r pending record(s), "
+                "an unfinished tail fragment is present"
+                % (committed, pending_count)
+            )
+        if base_seq != committed:
+            raise WalConflictError(
+                "base_seq %r does not match latest committed seq %r"
+                % (base_seq, committed)
+            )
+        # Append each change record and then the sealing commit, one
+        # durable record at a time, exactly as restore does. An OSError
+        # propagates with the old committed state and seq in place; the
+        # already-written records form the batch's pending tail.
+        new_seq = committed + 1
+        for change in normalized:
+            record = dict(change)
+            record["seq"] = new_seq
+            self._append(record)
         self._append({"op": "commit", "seq": new_seq})
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
