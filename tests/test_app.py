@@ -2342,6 +2342,325 @@ class ExclusiveLeaseTest(unittest.TestCase):
         s.close()
 
 
+class ReadOnlyModeTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def lock_path(self, path=None):
+        import os
+        return Path(os.path.abspath(str(path or self.path)) + ".lock")
+
+    def build_committed(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+
+    def build_with_pending(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        return s
+
+    def test_readonly_param_must_be_bool(self):
+        for bad in (0, 1, "yes", None, object()):
+            with self.assertRaises(ValueError):
+                WalStore(self.path, readonly=bad)
+        # Validation fails before any path is read or created.
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+
+    def test_readonly_and_exclusive_together_raise_valueerror(self):
+        with self.assertRaises(ValueError):
+            WalStore(self.path, exclusive=True, readonly=True)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+
+    def test_validation_failure_does_not_touch_existing_log(self):
+        w = self.build_with_pending()
+        raw = self.path.read_bytes()
+        size = self.path.stat().st_size
+        for kwargs in (
+            {"readonly": "x"},
+            {"exclusive": 1, "readonly": True},
+            {"exclusive": True, "readonly": True},
+        ):
+            with self.assertRaises(ValueError):
+                WalStore(self.path, **kwargs)
+        self.assertEqual(self.path.read_bytes(), raw)
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual(w.state, {"a": 1})
+        self.assertEqual(w.commit_seq, 1)
+        w.close()
+
+    def test_missing_log_recovers_empty_and_creates_nothing(self):
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, {})
+        self.assertEqual(r.commit_seq, 0)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+        self.assertEqual(r.recover()["pending_count"], 0)
+        self.assertEqual(r.snapshot(0)["state"], {})
+        self.assertEqual(r.history(), [])
+        self.assertEqual(r.pending_changes()["changes"], [])
+        audit = r.audit()
+        self.assertEqual(
+            (audit["valid_bytes"], audit["committed_bytes"], audit["tail_bytes"]),
+            (0, 0, 0),
+        )
+        r.close()
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+
+    def test_missing_log_does_not_create_parent_dir(self):
+        deep = self.path.parent / "sub" / "deep" / "x.wal"
+        r = WalStore(deep, readonly=True)
+        self.assertFalse(deep.exists())
+        self.assertFalse(deep.parent.exists())
+        r.close()
+
+    def test_empty_log_recovers_empty(self):
+        self.path.write_bytes(b"")
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, {})
+        self.assertEqual(r.commit_seq, 0)
+        self.assertEqual(r.recover()["pending_count"], 0)
+        self.assertEqual(self.path.read_bytes(), b"")
+        r.close()
+
+    def test_queries_match_writable_instance(self):
+        w = self.build_with_pending()
+        w_ref = WalStore(self.path)
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, w_ref.state)
+        self.assertEqual(r.state, {"a": 1})
+        self.assertEqual(r.commit_seq, 1)
+        self.assertEqual(r.recover(), w_ref.recover())
+        self.assertEqual(r.snapshot(), w_ref.snapshot())
+        self.assertEqual(r.snapshot(0), w_ref.snapshot(0))
+        self.assertEqual(r.history(), w_ref.history())
+        self.assertEqual(r.pending_changes(), w_ref.pending_changes())
+        self.assertEqual(r.audit(), w_ref.audit())
+        self.assertEqual(r.get("a"), w_ref.get("a"))
+        self.assertEqual(r.get("z", 7), w_ref.get("z", 7))
+        self.assertEqual(r.contains("a"), w_ref.contains("a"))
+        # The pending record is observable, not committed.
+        pc = r.pending_changes()
+        self.assertEqual(pc["pending_count"], 1)
+        self.assertEqual(
+            pc["changes"], [{"op": "set", "key": "b", "value": 2}]
+        )
+        r.close()
+        w_ref.close()
+        w.close()
+
+    def test_tail_fragment_uses_existing_discard_and_audit_rules(self):
+        self.build_committed()
+        fragment = b'{"op": "set", "key": "x", "val'
+        self.path.write_bytes(self.path.read_bytes() + fragment)
+        raw = self.path.read_bytes()
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, {"a": 1})
+        self.assertEqual(r.commit_seq, 1)
+        self.assertEqual(r.pending_changes()["pending_count"], 0)
+        audit = r.audit()
+        self.assertEqual(audit["tail_bytes"], len(fragment))
+        self.assertEqual(audit["pending_count"], 0)
+        # Bytes survive: read-only repair cannot remove the fragment.
+        self.assertEqual(self.path.read_bytes(), raw)
+        r.close()
+
+    def test_unterminated_complete_record_kept_as_tail(self):
+        self.build_committed()
+        rec = json.dumps(
+            {"op": "set", "key": "b", "value": 2, "seq": 2}, sort_keys=True
+        )
+        self.path.write_bytes(self.path.read_bytes() + rec.encode("utf-8"))
+        raw = self.path.read_bytes()
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, {"a": 1})
+        self.assertEqual(r.commit_seq, 1)
+        self.assertEqual(r.audit()["tail_bytes"], len(rec.encode("utf-8")))
+        self.assertEqual(r.pending_changes()["changes"], [])
+        self.assertEqual(self.path.read_bytes(), raw)
+        r.close()
+
+    def test_corruption_still_raises_on_readonly_open(self):
+        self.build_committed()
+        self.path.write_bytes(self.path.read_bytes() + b"not-a-record\n")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, readonly=True)
+
+    def test_corruption_in_query_raises_and_changes_nothing(self):
+        self.build_committed()
+        r = WalStore(self.path, readonly=True)
+        self.path.write_bytes(self.path.read_bytes() + b"garbage\n")
+        raw = self.path.read_bytes()
+        with self.assertRaises(WalCorruptionError):
+            r.snapshot()
+        with self.assertRaises(WalCorruptionError):
+            r.audit()
+        self.assertEqual(self.path.read_bytes(), raw)
+        self.assertEqual(r.state, {"a": 1})
+        self.assertEqual(r.commit_seq, 1)
+        r.close()
+
+    def test_mutators_raise_readonly_without_any_change(self):
+        w = self.build_with_pending()
+        raw = self.path.read_bytes()
+        size = self.path.stat().st_size
+        r = WalStore(self.path, readonly=True)
+        calls = [
+            lambda: r.set("c", 3),
+            lambda: r.delete("a"),
+            lambda: r.commit(),
+            lambda: r.rollback(),
+            lambda: r.restore(0),
+            lambda: r.repair_tail(),
+        ]
+        for call in calls:
+            with self.assertRaises(app.WalReadOnlyError):
+                call()
+        # No truncation, append, seq advance, or in-memory change.
+        self.assertEqual(self.path.read_bytes(), raw)
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual(r.state, {"a": 1})
+        self.assertEqual(r.commit_seq, 1)
+        self.assertEqual(r.pending_changes()["pending_count"], 1)
+        r.close()
+        w.close()
+
+    def test_mutators_raise_before_argument_validation_side_effects(self):
+        # Even with a bad key/value/target, read-only refusal comes first and
+        # leaves the log untouched; the read-only error type is stable.
+        self.build_committed()
+        raw = self.path.read_bytes()
+        r = WalStore(self.path, readonly=True)
+        with self.assertRaises(app.WalReadOnlyError):
+            r.set(123, 1)
+        with self.assertRaises(app.WalReadOnlyError):
+            r.restore("not-an-int")
+        self.assertEqual(self.path.read_bytes(), raw)
+        r.close()
+
+    def test_complete_uncommitted_record_bytes_preserved(self):
+        w = self.build_with_pending()
+        raw = self.path.read_bytes()
+        r = WalStore(self.path, readonly=True)
+        for call in (r.commit, r.rollback, r.repair_tail, lambda: r.restore(0)):
+            with self.assertRaises(app.WalReadOnlyError):
+                call()
+        self.assertEqual(self.path.read_bytes(), raw)
+        # A writer can still commit those preserved bytes afterwards.
+        self.assertEqual(w.commit(), 2)
+        self.assertEqual(r.get("b"), 2)
+        r.close()
+        w.close()
+
+    def test_opens_alongside_live_exclusive_writer(self):
+        w = self.build_with_pending()  # still open, lease held
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, {"a": 1})
+        r2 = WalStore(self.path, readonly=True)
+        self.assertEqual(r2.state, {"a": 1})
+        # Reader observes the writer's subsequent durable commits.
+        self.assertEqual(w.commit(), 2)
+        self.assertEqual(r.snapshot()["state"], {"a": 1, "b": 2})
+        self.assertEqual(r2.get("b"), 2)
+        r2.close()
+        r.close()
+        w.close()
+
+    def test_readonly_never_acquires_lease(self):
+        self.build_committed()
+        lock = self.lock_path()
+        w = WalStore(self.path, exclusive=True)
+        self.assertTrue(lock.exists())
+        mtime = lock.stat().st_mtime_ns
+        r = WalStore(self.path, readonly=True)
+        r.audit()
+        r.close()
+        # The reader neither recreated nor altered the lock file.
+        self.assertEqual(lock.stat().st_mtime_ns, mtime)
+        w.close()
+
+    def test_readonly_does_not_create_lock_for_missing_log(self):
+        r = WalStore(self.path, readonly=True)
+        r.close()
+        self.assertFalse(self.lock_path().exists())
+
+    def test_closed_readonly_prefers_walclosederror(self):
+        self.build_committed()
+        r = WalStore(self.path, readonly=True)
+        r.close()
+        r.close()  # idempotent
+        calls = [
+            lambda: r.set("c", 3),
+            lambda: r.delete("a"),
+            lambda: r.commit(),
+            lambda: r.rollback(),
+            lambda: r.restore(0),
+            lambda: r.repair_tail(),
+            lambda: r.recover(),
+            lambda: r.get("a"),
+            lambda: r.contains("a"),
+            lambda: r.snapshot(),
+            lambda: r.history(),
+            lambda: r.pending_changes(),
+            lambda: r.audit(),
+        ]
+        for call in calls:
+            with self.assertRaises(app.WalClosedError):
+                call()
+
+    def test_context_manager_is_idempotent(self):
+        self.build_committed()
+        with WalStore(self.path, readonly=True) as r:
+            self.assertEqual(r.get("a"), 1)
+        with self.assertRaises(app.WalClosedError):
+            r.get("a")
+        r.close()
+
+    def test_deep_copy_conventions_preserved(self):
+        s = WalStore(self.path)
+        s.set("nested", {"x": [1, 2]})
+        s.commit()
+        s.close()
+        r = WalStore(self.path, readonly=True)
+        value = r.get("nested")
+        value["x"].append(3)
+        self.assertEqual(r.get("nested"), {"x": [1, 2]})
+        snap = r.snapshot()["state"]
+        snap["nested"]["x"].append(9)
+        self.assertEqual(r.snapshot()["state"]["nested"], {"x": [1, 2]})
+        r.close()
+
+    def test_legacy_log_reads_without_migration(self):
+        self.build_committed()
+        raw_before = self.path.read_bytes()
+        r = WalStore(self.path, readonly=True)
+        self.assertEqual(r.state, {"a": 1})
+        r.close()
+        self.assertEqual(self.path.read_bytes(), raw_before)
+
+    def test_omitted_readonly_and_false_remain_writable(self):
+        s = WalStore(self.path)
+        s.set("x", 1)
+        self.assertEqual(s.commit(), 1)
+        s.close()
+        s2 = WalStore(self.path, exclusive=False, readonly=False)
+        s2.set("y", 2)
+        self.assertEqual(s2.commit(), 2)
+        self.assertEqual(s2.state, {"x": 1, "y": 2})
+        s2.rollback()
+        s2.close()
+
+
 class RestoreTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
