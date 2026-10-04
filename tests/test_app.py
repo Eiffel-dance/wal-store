@@ -3297,5 +3297,479 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(s.get("b"), {"n": [1]})
 
 
+class ApplyBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def test_empty_batch_is_an_empty_commit(self):
+        s = WalStore(self.path)
+        self.assertEqual(s.apply_batch(0, []), 1)
+        self.assertEqual((s.state, s.commit_seq), ({}, 1))
+        self.assertEqual(
+            self.path.read_text(),
+            json.dumps({"op": "commit", "seq": 1}, sort_keys=True) + "\n",
+        )
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({}, 1))
+        self.assertEqual(s2.history(), [{"commit_seq": 1, "changes": []}])
+        # an empty batch on a populated store only advances the seq
+        self.assertEqual(s2.apply_batch(1, [{"op": "set", "key": "a", "value": 1}]), 2)
+        size = self.log_size()
+        self.assertEqual(s2.apply_batch(2, []), 3)
+        added = self.path.read_bytes()[size:]
+        self.assertEqual(
+            added.decode(),
+            json.dumps({"op": "commit", "seq": 3}, sort_keys=True) + "\n",
+        )
+        self.assertEqual(s2.state, {"a": 1})
+        self.assertEqual(s2.history()[-1], {"commit_seq": 3, "changes": []})
+
+    def test_batch_log_matches_item_by_item_writes(self):
+        changes = [
+            {"op": "set", "key": "a", "value": 1},
+            {"op": "set", "key": "b", "value": {"n": [1, 2]}},
+            {"op": "delete", "key": "a"},
+            {"op": "set", "key": "c", "value": "x"},
+            {"op": "set", "key": "b", "value": {"n": [9]}},
+        ]
+        s = WalStore(self.path)
+        s.set("seed", 0)
+        s.commit()  # seq 1
+        self.assertEqual(s.apply_batch(1, changes), 2)
+        # reference: the same operations through the existing entry points
+        ref_path = Path(self.dir.name) / "ref.wal"
+        ref = WalStore(ref_path)
+        ref.set("seed", 0)
+        ref.commit()
+        for ch in changes:
+            if ch["op"] == "set":
+                ref.set(ch["key"], ch["value"])
+            else:
+                ref.delete(ch["key"])
+        ref.commit()
+        # the durable log is byte-for-byte the item-by-item replay
+        self.assertEqual(self.path.read_bytes(), ref_path.read_bytes())
+        self.assertEqual(s.state, ref.state)
+        self.assertEqual(s.history(), ref.history())
+        self.assertEqual(s.snapshot(), ref.snapshot())
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), (ref.state, 2))
+        self.assertEqual(reopened.history(), ref.history())
+
+    def test_duplicate_keys_apply_in_given_order(self):
+        s = WalStore(self.path)
+        changes = [
+            {"op": "set", "key": "k", "value": 1},
+            {"op": "set", "key": "k", "value": 2},
+            {"op": "delete", "key": "k"},
+            {"op": "set", "key": "k", "value": 3},
+            {"op": "delete", "key": "missing"},  # deleting an absent key is fine
+        ]
+        self.assertEqual(s.apply_batch(0, changes), 1)
+        self.assertEqual(s.state, {"k": 3})
+        # history preserves the batch's original write order
+        self.assertEqual(
+            s.history()[0]["changes"],
+            [
+                {"op": "set", "key": "k", "value": 1},
+                {"op": "set", "key": "k", "value": 2},
+                {"op": "delete", "key": "k"},
+                {"op": "set", "key": "k", "value": 3},
+                {"op": "delete", "key": "missing"},
+            ],
+        )
+        reopened = WalStore(self.path)
+        self.assertEqual(reopened.state, {"k": 3})
+        self.assertEqual(reopened.snapshot(1)["state"], {"k": 3})
+
+    def test_chained_batches_across_reopen(self):
+        s = WalStore(self.path)
+        self.assertEqual(s.apply_batch(0, [{"op": "set", "key": "a", "value": 1}]), 1)
+        self.assertEqual(s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}]), 2)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+        self.assertEqual(
+            s2.apply_batch(
+                2,
+                [
+                    {"op": "delete", "key": "a"},
+                    {"op": "set", "key": "c", "value": 3},
+                ],
+            ),
+            3,
+        )
+        s3 = WalStore(self.path)
+        self.assertEqual((s3.state, s3.commit_seq), ({"b": 2, "c": 3}, 3))
+        self.assertEqual(s3.snapshot(1)["state"], {"a": 1})
+        self.assertEqual(s3.snapshot(2)["state"], {"a": 1, "b": 2})
+        self.assertEqual([e["commit_seq"] for e in s3.history()], [1, 2, 3])
+        self.assertEqual(s3.recover().pending_count, 0)
+
+    def test_changes_collection_may_be_any_ordered_iterable(self):
+        s = WalStore(self.path)
+        changes = (
+            {"op": "set", "key": "a", "value": 1},
+            {"op": "delete", "key": "b"},
+        )
+        self.assertEqual(s.apply_batch(0, changes), 1)
+        self.assertEqual(s.state, {"a": 1})
+
+    def test_invalid_base_seq_raises_valueerror_without_side_effects(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        before = self.path.read_bytes()
+        for bad in (True, False, -1, -10**9, 1.0, 1.5, "1", b"1", [1],
+                    None, {"s": 1}, object()):
+            with self.assertRaises(ValueError, msg=bad):
+                s.apply_batch(bad, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+    def test_invalid_base_seq_on_missing_log_creates_nothing(self):
+        s = WalStore(self.path)
+        for bad in (True, -1, "0", None):
+            with self.assertRaises(ValueError, msg=bad):
+                s.apply_batch(bad, [])
+        self.assertFalse(self.path.exists())
+
+    def test_invalid_changes_raise_valueerror_without_side_effects(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        before = self.path.read_bytes()
+        circular = {}
+        circular["self"] = circular
+        bad_changes = [
+            None, 0, 1.5, "set", b"bytes", {"op": "set"}, {"a", "b"}, object(),
+            [None], [1], ["set"], [["op", "set"]],
+            [{"op": "commit"}],  # commit is not a change record
+            [{"op": "bogus", "key": "a"}],
+            [{"key": "a", "value": 1}],  # missing op
+            [{"op": "set", "key": "a"}],  # set without value
+            [{"op": "set", "key": "a", "value": 1, "seq": 2}],  # extra field
+            [{"op": "delete", "key": "a", "value": 1}],  # delete carries only key
+            [{"op": "delete"}],  # delete without key
+            [{"op": "set", "key": 1, "value": 1}],  # non-string key
+            [{"op": "delete", "key": b"a"}],
+            [{"op": "set", "key": "a", "value": float("nan")}],
+            [{"op": "set", "key": "a", "value": float("inf")}],
+            [{"op": "set", "key": "a", "value": {1: 2}}],  # non-string object key
+            [{"op": "set", "key": "a", "value": object()}],
+            [{"op": "set", "key": "a", "value": circular}],
+            # a bad later item rejects the whole batch before any write
+            [{"op": "set", "key": "ok", "value": 1}, {"op": "delete"}],
+        ]
+        for bad in bad_changes:
+            with self.assertRaises(ValueError, msg=bad):
+                s.apply_batch(1, bad)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s.pending_changes().pending_count, 0)
+
+    def test_base_seq_mismatch_raises_unique_conflict_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()  # seq 1
+        s.set("b", 2)
+        s.commit()  # seq 2
+        before = self.path.read_bytes()
+        for bad_base in (0, 1, 3, 10**9):
+            with self.assertRaises(app.WalConflictError, msg=bad_base):
+                s.apply_batch(bad_base, [{"op": "set", "key": "c", "value": 3}])
+            with self.assertRaises(app.WalConflictError, msg=bad_base):
+                s.apply_batch(bad_base, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        self.assertEqual(s.pending_changes().pending_count, 0)
+        # the matching base still goes through
+        self.assertEqual(s.apply_batch(2, []), 3)
+
+    def test_conflict_on_empty_log_creates_nothing(self):
+        s = WalStore(self.path)
+        with self.assertRaises(app.WalConflictError):
+            s.apply_batch(1, [{"op": "set", "key": "a", "value": 1}])
+        self.assertFalse(self.path.exists())
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+
+    def test_argument_errors_precede_log_validation(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(b'{"op": "set", "key": "x"}\n')  # corrupt record
+        with self.assertRaises(ValueError):
+            s.apply_batch(-1, [])
+        with self.assertRaises(ValueError):
+            s.apply_batch(1, [{"op": "bogus"}])
+        with self.assertRaises(WalCorruptionError):
+            s.apply_batch(1, [])
+
+    def test_corruption_raises_only_corruption_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        before = self.path.read_bytes()
+        bad = b'{"op": "set", "key": "x"}\n'  # terminated but invalid
+        self.append_bytes(bad)
+        with self.assertRaises(WalCorruptionError):
+            s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}])
+        # corruption is reported even when the base seq would also mismatch
+        with self.assertRaises(WalCorruptionError):
+            s.apply_batch(5, [{"op": "set", "key": "b", "value": 2}])
+        self.assertEqual(self.path.read_bytes(), before + bad)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+    def test_pending_records_raise_pending_error_without_change(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # uncommitted
+        before = self.path.read_bytes()
+        with self.assertRaises(WalPendingError):
+            s.apply_batch(1, [{"op": "set", "key": "c", "value": 3}])
+        with self.assertRaises(WalPendingError):
+            s.apply_batch(1, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s.rollback(), 1)
+        self.assertEqual(s.apply_batch(1, [{"op": "set", "key": "c", "value": 3}]), 2)
+        self.assertEqual(s.state, {"a": 1, "c": 3})
+
+    def test_pending_records_before_any_commit_raise_pending_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        before = self.path.read_bytes()
+        with self.assertRaises(WalPendingError):
+            s.apply_batch(0, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+
+    def test_tail_fragment_raises_pending_error_without_change(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        before = self.path.read_bytes()
+        fragments = [
+            '{"op": "set", "key": "x"',
+            "{",
+            '{"op": "commit", "seq": 2',
+            json.dumps({"op": "set", "key": "x", "value": 9, "seq": 2}),
+            '{"op": "set", "key": "hé'.encode("utf-8")[:-1],
+        ]
+        for frag in fragments:
+            raw = frag if isinstance(frag, bytes) else frag.encode("utf-8")
+            self.path.write_bytes(before)
+            self.append_bytes(raw)
+            with self.assertRaises(WalPendingError, msg=frag):
+                s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}])
+            self.assertEqual(self.path.read_bytes(), before + raw, msg=frag)
+            self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1), msg=frag)
+        self.path.write_bytes(before)
+        self.append_bytes(fragments[0])
+        s.repair_tail()
+        self.assertEqual(s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}]), 2)
+        self.assertEqual(s.state, {"a": 1, "b": 2})
+
+    def test_readonly_raises_readonly_error_before_any_change(self):
+        w = WalStore(self.path)
+        w.set("a", 1)
+        w.commit()
+        raw = self.path.read_bytes()
+        r = WalStore(self.path, readonly=True)
+        with self.assertRaises(app.WalReadOnlyError):
+            r.apply_batch(1, [{"op": "set", "key": "b", "value": 2}])
+        # read-only refusal precedes argument validation
+        with self.assertRaises(app.WalReadOnlyError):
+            r.apply_batch("bad", "bad")
+        self.assertEqual(self.path.read_bytes(), raw)
+        self.assertEqual((r.state, r.commit_seq), ({"a": 1}, 1))
+        r.close()
+        w.close()
+
+    def test_closed_raises_closed_error(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.apply_batch(1, [])
+        s.close()  # close stays idempotent
+
+    def test_changes_and_result_do_not_share_mutable_objects(self):
+        s = WalStore(self.path)
+        nested = {"n": [1]}
+        changes = [
+            {"op": "set", "key": "a", "value": nested},
+            {"op": "set", "key": "b", "value": [1, {"k": 2}]},
+        ]
+        self.assertEqual(s.apply_batch(0, changes), 1)
+        # mutating the caller's collection afterwards never reaches the store
+        nested["n"].append(99)
+        changes[1]["value"][1]["k"] = 7
+        changes.append({"op": "delete", "key": "a"})
+        self.assertEqual(s.state, {"a": {"n": [1]}, "b": [1, {"k": 2}]})
+        self.assertEqual(s.get("a"), {"n": [1]})
+        reopened = WalStore(self.path)
+        self.assertEqual(reopened.state, {"a": {"n": [1]}, "b": [1, {"k": 2}]})
+        self.assertEqual(
+            reopened.history()[-1]["changes"],
+            [
+                {"op": "set", "key": "a", "value": {"n": [1]}},
+                {"op": "set", "key": "b", "value": [1, {"k": 2}]},
+            ],
+        )
+        # the store never mutated the caller's collection either
+        self.assertEqual(changes[0], {"op": "set", "key": "a", "value": {"n": [1, 99]}})
+
+    def test_oserror_on_first_record_leaves_no_pending(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        with mock.patch("app.os.fsync", side_effect=OSError("disk on fire")):
+            with self.assertRaises(OSError):
+                s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}])
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s.pending_changes().pending_count, 0)
+        # the seq chain is not consumed by the failed batch
+        self.assertEqual(s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}]), 2)
+        self.assertEqual(WalStore(self.path).state, {"a": 1, "b": 2})
+
+    def test_oserror_mid_batch_leaves_pending_prefix(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()  # seq 1
+        real_fsync = app.os.fsync
+        calls = {"n": 0}
+
+        def fail_second(fd):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk on fire")
+            return real_fsync(fd)
+
+        changes = [
+            {"op": "set", "key": "b", "value": 2},
+            {"op": "set", "key": "c", "value": 3},
+            {"op": "delete", "key": "a"},
+        ]
+        with mock.patch("app.os.fsync", side_effect=fail_second):
+            with self.assertRaises(OSError):
+                s.apply_batch(1, changes)
+        # memory state and commit_seq never advanced
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # the durable-but-unsealed prefix is observable as pending ...
+        pc = s.pending_changes()
+        self.assertEqual(pc.commit_seq, 1)
+        self.assertEqual(pc.changes, [{"op": "set", "key": "b", "value": 2}])
+        # ... and a reopen ("process killed at the write boundary")
+        # recovers to the last complete commit, never the partial batch
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s2.pending_changes().pending_count, 1)
+        # rollback clears the prefix and the batch can be retried
+        self.assertEqual(s.rollback(), 1)
+        self.assertEqual(s.pending_changes().pending_count, 0)
+        self.assertEqual(s.apply_batch(1, changes), 2)
+        self.assertEqual(s.state, {"b": 2, "c": 3})
+        self.assertEqual(WalStore(self.path).state, {"b": 2, "c": 3})
+
+    def test_oserror_on_commit_record_keeps_whole_batch_pending(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        real_fsync = app.os.fsync
+        calls = {"n": 0}
+
+        def fail_third(fd):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise OSError("disk on fire")
+            return real_fsync(fd)
+
+        changes = [
+            {"op": "set", "key": "b", "value": 2},
+            {"op": "delete", "key": "a"},
+        ]
+        with mock.patch("app.os.fsync", side_effect=fail_third):
+            with self.assertRaises(OSError):
+                s.apply_batch(1, changes)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        pc = s.pending_changes()
+        self.assertEqual(pc.changes, [
+            {"op": "set", "key": "b", "value": 2},
+            {"op": "delete", "key": "a"},
+        ])
+        # a reopen still shows only the last complete commit
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        # the surviving pending batch can still be sealed by a plain commit
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(s.state, {"b": 2})
+        self.assertEqual(WalStore(self.path).commit_seq, 2)
+
+    def test_exclusive_lease_covers_apply_batch(self):
+        s = WalStore(self.path, exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        self.assertEqual(s.apply_batch(0, [{"op": "set", "key": "a", "value": 1}]), 1)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s.close()
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+
+    def test_legacy_log_continues_seq_chain(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.apply_batch(
+                1,
+                [
+                    {"op": "set", "key": "k", "value": 2},
+                    {"op": "set", "key": "n", "value": None},
+                ],
+            ),
+            2,
+        )
+        self.assertEqual(s.state, {"k": 2, "n": None})
+        self.assertEqual(WalStore(self.path).commit_seq, 2)
+
+    def test_existing_entry_points_behave_unchanged_after_apply_batch(self):
+        s = WalStore(self.path)
+        s.apply_batch(0, [{"op": "set", "key": "a", "value": 1}])
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s.set("c", 3)
+        self.assertEqual(s.rollback(), 1)
+        s.delete("a")
+        self.assertEqual(s.commit(), 3)
+        self.assertEqual(s.state, {"b": 2})
+        self.assertEqual(s.restore(1), 4)
+        self.assertEqual(s.state, {"a": 1})
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), ({"a": 1}, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

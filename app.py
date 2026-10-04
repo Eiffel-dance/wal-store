@@ -35,6 +35,16 @@ class WalPendingError(Exception):
     """
 
 
+class WalConflictError(Exception):
+    """Raised by apply_batch() when the caller's base seq is stale.
+
+    The caller-declared base commit seq must equal the store's latest
+    committed seq; a mismatch means the log has already advanced past the
+    state the batch was built against, so the batch is refused before
+    anything is written.
+    """
+
+
 class RecoveryResult(dict):
     """Plain result mapping; keys are also readable as attributes."""
 
@@ -156,6 +166,56 @@ def _validate_value(root):
             "value must be composed of JSON-compatible types, got %r"
             % (type(value).__name__,)
         )
+
+
+def _validate_batch_changes(changes):
+    """Materialize and fully validate an apply_batch change collection.
+
+    Returns the items as a list. The collection must be ordered (a dict,
+    set, string, or non-iterable is rejected), and every item must be a
+    dict carrying exactly the fields of the corresponding log record
+    semantics: {"op": "set", "key", "value"} or {"op": "delete", "key"}.
+    Keys and values follow the same rules as set()/delete(). Any
+    deviation raises ValueError before the log is touched.
+    """
+    if isinstance(changes, (str, bytes, bytearray, dict, set, frozenset)):
+        raise ValueError(
+            "changes must be an ordered collection of change records, got %r"
+            % (type(changes).__name__,)
+        )
+    try:
+        items = list(changes)
+    except TypeError:
+        raise ValueError(
+            "changes must be an ordered collection of change records, got %r"
+            % (type(changes).__name__,)
+        ) from None
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(
+                "change must be a dict, got %r" % (type(item).__name__,)
+            )
+        op = item.get("op")
+        if op == "set":
+            if set(item) != {"op", "key", "value"}:
+                raise ValueError(
+                    "set change must carry exactly op, key and value: %r"
+                    % (list(item),)
+                )
+            _validate_key(item["key"])
+            _validate_value(item["value"])
+        elif op == "delete":
+            if set(item) != {"op", "key"}:
+                raise ValueError(
+                    "delete change must carry exactly op and key: %r"
+                    % (list(item),)
+                )
+            _validate_key(item["key"])
+        else:
+            raise ValueError(
+                "change op must be 'set' or 'delete', got %r" % (op,)
+            )
+    return items
 
 
 def _json_equal(a, b):
@@ -750,6 +810,99 @@ class WalStore:
                         "op": "set",
                         "key": key,
                         "value": copy.deepcopy(target[key]),
+                        "seq": new_seq,
+                    }
+                )
+        self._append({"op": "commit", "seq": new_seq})
+        # Adopt the new committed view only once its commit boundary is
+        # durable, exactly as commit() does.
+        self.recover()
+        return self.commit_seq
+
+    def apply_batch(self, base_seq, changes):
+        """Atomically commit an ordered batch of set/delete changes.
+
+        Every change is appended to the log first, in the given order,
+        and the batch is sealed by one new commit record; on success the
+        new commit_seq is returned and the durable state, snapshot,
+        history, and a reopened recover() are exactly what applying the
+        same changes one by one through set()/delete()/commit() would
+        produce. changes must be an ordered collection of change records:
+        a set item carries exactly op/key/value, a delete item exactly
+        op/key; keys and values follow the same JSON-compatibility rules
+        as set()/delete(). An empty collection is an empty commit that
+        only advances the seq. Neither the caller's collection nor the
+        returned value shares mutable nested objects with the store.
+
+        base_seq is the caller-declared commit the batch builds on; it
+        must be a non-boolean non-negative integer and equal to the
+        latest committed seq, otherwise ValueError or WalConflictError is
+        raised. Arguments are fully validated first, then the whole log
+        is validated under the exact recover rules (any corruption raises
+        WalCorruptionError), the base seq is compared, and the log must
+        be settled at the last commit: complete uncommitted set/delete
+        records or a recognisable unfinished tail fragment raise
+        WalPendingError. Every refusal happens before anything is
+        written: no append, no truncation, no in-memory change.
+
+        The write phase reuses the single-writer lease, per-record flush
+        and fsync, and the monotonic seq rules: if any change record or
+        the final commit fails before it is durable, the original OSError
+        propagates, the already-written unsealed prefix stays observable
+        through pending_changes() and clearable through rollback(), and
+        neither the in-memory state nor commit_seq advances; a process
+        terminated at any write boundary recovers to the last complete
+        commit on reopen, never to a partially sealed batch.
+        """
+        self._check_writable()
+        if (
+            isinstance(base_seq, bool)
+            or not isinstance(base_seq, int)
+            or base_seq < 0
+        ):
+            raise ValueError(
+                "base_seq must be a non-negative integer, got %r" % (base_seq,)
+            )
+        items = _validate_batch_changes(changes)
+        # Full recover-rule validation of the log, purely into local
+        # objects: corruption raises WalCorruptionError before anything
+        # is written, truncated, or adopted.
+        (
+            _candidate,
+            committed,
+            pending_count,
+            _valid_size,
+            _committed_size,
+        ) = self._replay()
+        # The declared base must be exactly the latest committed seq:
+        # the batch is applied on top of that commit and no other.
+        if base_seq != committed:
+            raise WalConflictError(
+                "base_seq %r does not match latest committed seq %r"
+                % (base_seq, committed)
+            )
+        # The log must be settled: neither a complete, terminated
+        # uncommitted batch nor an unfinished tail fragment may be
+        # spliced into (the same refusal restore() makes).
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > self._valid_size:
+            raise WalPendingError(
+                "log is not settled at commit %r: %r pending record(s), "
+                "an unfinished tail fragment is present"
+                % (committed, pending_count)
+            )
+        new_seq = committed + 1
+        for item in items:
+            if item["op"] == "delete":
+                self._append({"op": "delete", "key": item["key"], "seq": new_seq})
+            else:
+                # Deep copy: the stored record must never share mutable
+                # nested objects with the caller's change collection.
+                self._append(
+                    {
+                        "op": "set",
+                        "key": item["key"],
+                        "value": copy.deepcopy(item["value"]),
                         "seq": new_seq,
                     }
                 )
