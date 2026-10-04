@@ -19,6 +19,10 @@ class WalClosedError(Exception):
     """Raised when any public method is called on a closed WalStore."""
 
 
+class WalReadOnlyError(Exception):
+    """Raised when a write entry point is called on a read-only WalStore."""
+
+
 class WalPendingError(Exception):
     """Raised by restore() when the log is not settled at the last commit.
 
@@ -196,11 +200,19 @@ def _reject_duplicate_keys(pairs):
 
 
 class WalStore:
-    def __init__(self, path, exclusive=False):
+    def __init__(self, path, exclusive=False, readonly=False):
+        # All argument validation happens before any path is read, created,
+        # or modified: a rejected call must leave the filesystem untouched.
         if not isinstance(exclusive, bool):
             raise ValueError(
                 "exclusive must be a bool, got %r" % (type(exclusive).__name__,)
             )
+        if not isinstance(readonly, bool):
+            raise ValueError(
+                "readonly must be a bool, got %r" % (type(readonly).__name__,)
+            )
+        if exclusive and readonly:
+            raise ValueError("exclusive and readonly cannot both be True")
         self.path = Path(path)
         self.state = {}
         self.commit_seq = 0
@@ -208,6 +220,7 @@ class WalStore:
         # replay; anything beyond it is a discarded tail fragment.
         self._valid_size = None
         self._closed = False
+        self._readonly = readonly
         self._lock_fd = None
         if exclusive:
             # The lease is taken before the log is ever read: a conflicting
@@ -281,6 +294,14 @@ class WalStore:
         if self._closed:
             raise WalClosedError("WalStore is closed")
 
+    def _check_writable(self):
+        # A closed store reports WalClosedError first; only then does a
+        # read-only store reject the write. The check runs before any
+        # truncation, append, seq advance, or in-memory change.
+        self._check_open()
+        if self._readonly:
+            raise WalReadOnlyError("WalStore is read-only")
+
     def _drop_tail_fragment(self):
         """Remove a discarded tail fragment left by an interrupted write.
 
@@ -347,7 +368,7 @@ class WalStore:
     def set(self, key, value):
         # Validate fully before touching the log: a rejected call must never
         # create, truncate, or append to the file or alter in-memory state.
-        self._check_open()
+        self._check_writable()
         _validate_key(key)
         _validate_value(value)
         self._append(
@@ -355,7 +376,7 @@ class WalStore:
         )
 
     def delete(self, key):
-        self._check_open()
+        self._check_writable()
         _validate_key(key)
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
@@ -364,14 +385,14 @@ class WalStore:
         # once it is durable: a failed write must neither consume the seq nor
         # present a committed state.
         seq = self.commit_seq + 1
-        self._check_open()
+        self._check_writable()
         self._append({"op": "commit", "seq": seq})
         self.recover()
         return self.commit_seq
 
     def rollback(self):
         # Validate the log by the exact recovery rules before touching
-        self._check_open()
+        self._check_writable()
         # anything. The replay builds only local objects, so corruption raises
         # WalCorruptionError without partially replacing state or commit_seq.
         # committed_size is the byte offset just past the last commit record;
@@ -425,7 +446,7 @@ class WalStore:
         committed state and seq in place, already-written records simply
         forming the batch's pending tail (rollback clears them).
         """
-        self._check_open()
+        self._check_writable()
         if (
             isinstance(target_seq, bool)
             or not isinstance(target_seq, int)
@@ -763,7 +784,7 @@ class WalStore:
         raw number of tail bytes removed; on return the repaired log is
         durable and a reopen recovers exactly the accepted prefix.
         """
-        self._check_open()
+        self._check_writable()
         # The replay raises WalCorruptionError before the file or the
         # adopted state can be touched, and its accepted-prefix boundary is
         # the same valid_bytes audit reports.

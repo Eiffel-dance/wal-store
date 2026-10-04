@@ -2658,5 +2658,181 @@ class RestoreTest(unittest.TestCase):
         self.assertEqual(s.get("b"), {"n": [1]})
 
 
+class ReadOnlyTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def lock_path(self):
+        return Path(str(self.path.resolve()) + ".lock")
+
+    def build_log(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1, 2]})
+        s.commit()
+        s.set("c", 3)
+        s.commit()
+        s.close()
+
+    def test_readonly_param_must_be_bool(self):
+        for bad in (0, 1, "yes", None, object()):
+            with self.assertRaises(ValueError):
+                WalStore(self.path, readonly=bad)
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+
+    def test_readonly_and_exclusive_conflict(self):
+        with self.assertRaises(ValueError):
+            WalStore(self.path, exclusive=True, readonly=True)
+        # Validation fails before any path is read, created, or modified.
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+
+    def test_readonly_missing_log_stays_empty_and_creates_nothing(self):
+        s = WalStore(self.path, readonly=True)
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        r = s.recover()
+        self.assertEqual(r["state"], {})
+        self.assertEqual(r["commit_seq"], 0)
+        self.assertEqual(r["pending_count"], 0)
+        a = s.audit()
+        self.assertEqual(
+            (a["valid_bytes"], a["committed_bytes"], a["tail_bytes"]), (0, 0, 0)
+        )
+        self.assertFalse(self.path.exists())
+        self.assertFalse(self.lock_path().exists())
+        s.close()
+
+    def test_readonly_queries_match_normal_instance(self):
+        self.build_log()
+        # Add a complete uncommitted record and an unfinished tail fragment.
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "set", "key": "d", "value": 4, "seq": 3}))
+            f.write("\n")
+            f.write('{"op": "set", "key": "e", "va')
+        size = self.path.stat().st_size
+        normal = WalStore(self.path)
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual((ro.state, ro.commit_seq), (normal.state, normal.commit_seq))
+        r_ro, r_no = ro.recover(), normal.recover()
+        self.assertEqual(dict(r_ro), dict(r_no))
+        self.assertEqual(r_ro["pending_count"], 1)
+        self.assertEqual(dict(ro.snapshot()), dict(normal.snapshot()))
+        self.assertEqual(dict(ro.snapshot(1)), dict(normal.snapshot(1)))
+        self.assertEqual(ro.history(), normal.history())
+        self.assertEqual(dict(ro.pending_changes()), dict(normal.pending_changes()))
+        self.assertEqual(dict(ro.audit()), dict(normal.audit()))
+        self.assertGreater(ro.audit()["tail_bytes"], 0)
+        self.assertEqual(ro.get("a"), 1)
+        self.assertTrue(ro.contains("b"))
+        # Purely observational: the log bytes are untouched.
+        self.assertEqual(self.path.stat().st_size, size)
+        normal.close()
+        ro.close()
+
+    def test_readonly_corruption_still_raises(self):
+        self.build_log()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("not json\n")
+        # Opening replays the log, so corruption is rejected up front.
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, readonly=True)
+        # Corruption appearing after a readonly open fails every query.
+        self.path.unlink()
+        self.build_log()
+        s = WalStore(self.path, readonly=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write("not json\n")
+        for call in (s.recover, s.audit, s.history, s.pending_changes):
+            with self.assertRaises(WalCorruptionError):
+                call()
+        s.close()
+
+    def test_readonly_write_methods_raise_and_touch_nothing(self):
+        self.build_log()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "set", "key": "d", "value": 4, "seq": 3}))
+            f.write("\n")
+            f.write('{"op": "set", "key": "e", "va')
+        data = self.path.read_bytes()
+        s = WalStore(self.path, readonly=True)
+        state, seq = dict(s.state), s.commit_seq
+        calls = [
+            lambda: s.set("x", 1),
+            lambda: s.delete("a"),
+            lambda: s.commit(),
+            lambda: s.rollback(),
+            lambda: s.restore(0),
+            lambda: s.repair_tail(),
+        ]
+        for call in calls:
+            with self.assertRaises(app.WalReadOnlyError):
+                call()
+        # No truncation, append, seq advance, or in-memory change happened;
+        # the complete uncommitted record and the tail fragment survive.
+        self.assertEqual(self.path.read_bytes(), data)
+        self.assertEqual((s.state, s.commit_seq), (state, seq))
+        self.assertEqual(s.pending_changes()["pending_count"], 1)
+        self.assertGreater(s.audit()["tail_bytes"], 0)
+        s.close()
+        # A normal instance still observes and recovers the same log.
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), (state, seq))
+        self.assertEqual(s2.recover()["pending_count"], 1)
+        s2.close()
+
+    def test_readonly_closed_store_raises_walclosederror_first(self):
+        self.build_log()
+        s = WalStore(self.path, readonly=True)
+        s.close()
+        s.close()
+        for call in (
+            lambda: s.set("x", 1),
+            lambda: s.delete("a"),
+            lambda: s.commit(),
+            lambda: s.rollback(),
+            lambda: s.restore(0),
+            lambda: s.repair_tail(),
+            lambda: s.recover(),
+            lambda: s.audit(),
+        ):
+            with self.assertRaises(app.WalClosedError):
+                call()
+
+    def test_readonly_context_manager(self):
+        self.build_log()
+        with WalStore(self.path, readonly=True) as s:
+            self.assertEqual(s.state, {"a": 1, "b": {"n": [1, 2]}, "c": 3})
+        with self.assertRaises(app.WalClosedError):
+            s.recover()
+
+    def test_readonly_coexists_with_exclusive_writer(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        # A readonly open neither takes nor conflicts with the lease.
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual((ro.state, ro.commit_seq), ({"a": 1}, 1))
+        s.set("b", 2)
+        s.commit()
+        self.assertEqual(ro.recover()["state"], {"a": 1, "b": 2})
+        ro.close()
+        # A readonly instance never holds the lease either.
+        ro2 = WalStore(self.path, readonly=True)
+        s.close()
+        s2 = WalStore(self.path, exclusive=True)
+        s2.close()
+        ro2.close()
+
+    def test_readonly_does_not_create_lock_file(self):
+        s = WalStore(self.path, readonly=True)
+        s.close()
+        self.assertFalse(self.lock_path().exists())
+
+
 if __name__ == "__main__":
     unittest.main()
