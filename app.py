@@ -625,12 +625,38 @@ class WalStore:
         finally:
             os.close(fd)
 
+    def _revalidate_before_write(self):
+        """Re-validate the whole log under the exact recover rules before a write.
+
+        set/delete/commit must never append on top of bytes the instance
+        has not validated: the log may have been externally appended to or
+        corrupted since this instance last replayed it, and the cached
+        accepted-prefix boundary alone cannot tell a discardable tail
+        fragment from unknown data. The full recover validation (UTF-8,
+        JSON, field sets, seq continuity, key and value rules) therefore
+        runs against the current file from the start, purely into local
+        objects first. Corruption raises WalCorruptionError with nothing
+        appended, truncated, or adopted: state, commit_seq, and the cached
+        byte boundary a later rollback relies on all keep their previous
+        values. On success the replayed committed view and the freshly
+        derived valid_bytes/committed_bytes boundaries are adopted, so the
+        next record's seq follows the file's latest committed seq and the
+        tail drop in _append only ever removes the single recognised
+        unfinished fragment -- complete (uncommitted) set/delete records
+        before it are preserved, never mistaken for a fragment.
+        """
+        candidate, committed, _pending, _valid_size, _committed_size = self._replay()
+        self.state = candidate
+        self.commit_seq = committed
+        return committed
+
     def set(self, key, value):
         # Validate fully before touching the log: a rejected call must never
         # create, truncate, or append to the file or alter in-memory state.
         self._check_writable()
         _validate_key(key)
         _validate_value(value)
+        self._revalidate_before_write()
         self._append(
             {"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1}
         )
@@ -638,6 +664,7 @@ class WalStore:
     def delete(self, key):
         self._check_writable()
         _validate_key(key)
+        self._revalidate_before_write()
         self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
 
     def commit(self):
@@ -645,6 +672,7 @@ class WalStore:
         # once it is durable: a failed write must neither consume the seq nor
         # present a committed state.
         self._check_writable()
+        self._revalidate_before_write()
         seq = self.commit_seq + 1
         self._append({"op": "commit", "seq": seq})
         self.recover()

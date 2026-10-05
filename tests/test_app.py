@@ -2746,8 +2746,16 @@ class AliasLeaseTest(unittest.TestCase):
         # holder keeps its own lease, state, seq, and file bytes
         self.assertEqual(s.state, {"a": 1})
         self.assertEqual(s.commit_seq, 1)
-        s.set("b", 2)
-        self.assertEqual(s.commit(), 2)
+        # the holder's own writes re-validate the log first: the
+        # externally appended corruption is refused with
+        # WalCorruptionError, never silently truncated or overwritten,
+        # and nothing is appended, truncated, or adopted
+        with self.assertRaises(WalCorruptionError):
+            s.set("b", 2)
+        with self.assertRaises(WalCorruptionError):
+            s.commit()
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
         s.close()
 
     def test_alias_close_and_context_manager_release_identity_lease(self):
@@ -4561,6 +4569,264 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(r.removed_bytes, len(b'{"op": "set", "key": "frag"'))
         reopened = WalStore(self.path)
         self.assertEqual(reopened.scan(), s.scan())
+
+
+class WriteRevalidationTest(unittest.TestCase):
+    """set/delete/commit re-validate the whole log before appending.
+
+    Once a WalStore is open, its log may be externally appended to or
+    corrupted. Every write entry re-runs the full recover validation
+    (UTF-8, JSON, field sets, seq continuity, key/value rules) against
+    the current file before any byte is written, so a new modification
+    can never silently cover up unknown data.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def open_committed(self):
+        # A live store holding one committed batch: {"a": 1} at seq 1.
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        return s
+
+    def reset_log(self):
+        if self.path.exists():
+            self.path.unlink()
+
+    def append_bytes(self, data):
+        mode = "ab" if isinstance(data, bytes) else "a"
+        with self.path.open(mode) as f:
+            f.write(data)
+
+    def append_row(self, row, terminated=True):
+        line = row if isinstance(row, str) else json.dumps(row, sort_keys=True)
+        self.append_bytes(line + ("\n" if terminated else ""))
+
+    def record_line(self, row):
+        return (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+
+    def test_corruption_appended_after_open_blocks_every_write(self):
+        corrupt_payloads = [
+            b"not-json\n",  # terminated invalid JSON
+            b"\n",  # blank record
+            b"   \n",  # whitespace-only record
+            b"\xff\xfe\n",  # invalid UTF-8
+            b'{"op": "set", "key": "x", "value": 1, "seq": 2, "x": 1}\n',  # fields
+            b'{"op": "set", "key": "x", "seq": 2}\n',  # missing field
+            b'{"op": "bogus", "seq": 2}\n',  # unknown op
+            b'{"op": "set", "key": 1, "value": 1, "seq": 2}\n',  # bad key
+            b'{"op": "set", "key": "x", "value": NaN, "seq": 2}\n',  # constant
+            b'{"op": "commit", "seq": 2, "seq": 2}\n',  # duplicate field
+            b'{"op": "set", "key": "x", "value": 1, "seq": 5}\n',  # seq break
+        ]
+        for payload in corrupt_payloads:
+            with self.subTest(payload=payload):
+                self.reset_log()
+                s = self.open_committed()
+                self.append_bytes(payload)
+                before = self.path.read_bytes()
+                for mutate in (
+                    lambda: s.set("b", 2),
+                    lambda: s.delete("a"),
+                    lambda: s.commit(),
+                ):
+                    with self.assertRaises(WalCorruptionError):
+                        mutate()
+                    # nothing appended, truncated, or adopted
+                    self.assertEqual(self.path.read_bytes(), before)
+                    self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+                s.close()
+
+    def test_failed_write_preserves_boundary_seen_by_later_calls(self):
+        s = self.open_committed()
+        committed_prefix = self.path.read_bytes()
+        self.append_bytes(b"not-json\n")
+        corrupted = self.path.read_bytes()
+        with self.assertRaises(WalCorruptionError):
+            s.set("b", 2)
+        # the cached byte boundary is untouched: rollback and recover
+        # re-derive the same corruption from the same bytes
+        with self.assertRaises(WalCorruptionError):
+            s.rollback()
+        with self.assertRaises(WalCorruptionError):
+            s.recover()
+        self.assertEqual(self.path.read_bytes(), corrupted)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # externally removing the corruption unblocks the same instance;
+        # the next record follows the file's last committed seq
+        with self.path.open("wb") as f:
+            f.write(committed_prefix)
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    def test_uncommitted_records_appended_after_open_are_preserved(self):
+        s = self.open_committed()
+        prefix = self.path.read_bytes()
+        # a complete, terminated, valid uncommitted record lands externally
+        self.append_row({"op": "set", "key": "b", "value": 2, "seq": 2})
+        s.set("c", 3)  # joins the same pending batch at seq 2
+        # the external record was never mistaken for a discardable fragment
+        expected = prefix + self.record_line(
+            {"op": "set", "key": "b", "value": 2, "seq": 2}
+        ) + self.record_line({"op": "set", "key": "c", "value": 3, "seq": 2})
+        self.assertEqual(self.path.read_bytes(), expected)
+        pending = s.pending_changes()
+        self.assertEqual(pending["commit_seq"], 1)
+        self.assertEqual(pending["pending_count"], 2)
+        self.assertEqual(
+            pending["changes"],
+            [
+                {"op": "set", "key": "b", "value": 2},
+                {"op": "set", "key": "c", "value": 3},
+            ],
+        )
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2, "c": 3}, 2))
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), (s.state, 2))
+
+    def test_delete_after_external_uncommitted_records(self):
+        s = self.open_committed()
+        self.append_row({"op": "set", "key": "b", "value": 2, "seq": 2})
+        s.delete("a")
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual((s.state, s.commit_seq), ({"b": 2}, 2))
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), ({"b": 2}, 2))
+
+    def test_commit_after_external_uncommitted_records(self):
+        s = self.open_committed()
+        self.append_row({"op": "set", "key": "b", "value": 2, "seq": 2})
+        self.append_row({"op": "delete", "key": "a", "seq": 2})
+        # commit seals the externally appended batch as its own seq 2
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual((s.state, s.commit_seq), ({"b": 2}, 2))
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), ({"b": 2}, 2))
+
+    def test_external_commit_advances_next_record_seq(self):
+        s = self.open_committed()
+        # an entire external committed batch lands after this instance opened
+        self.append_row({"op": "set", "key": "b", "value": 2, "seq": 2})
+        self.append_row({"op": "commit", "seq": 2})
+        s.set("c", 3)  # must follow the file's latest committed seq, not 1
+        self.assertEqual(s.commit(), 3)
+        self.assertEqual(s.state, {"a": 1, "b": 2, "c": 3})
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), (s.state, 3))
+        self.assertEqual(
+            [batch["commit_seq"] for batch in reopened.history()], [1, 2, 3]
+        )
+
+    def test_tail_fragment_appended_after_open_is_dropped_before_set(self):
+        fragments = [
+            b'{"op": "set", "key": "fra',  # unfinished JSON prefix
+            b'{"op": "commit", "seq": 2}',  # complete record, no terminator
+            b'\xe4\xb8',  # truncated UTF-8 bytes
+        ]
+        for fragment in fragments:
+            with self.subTest(fragment=fragment):
+                self.reset_log()
+                s = self.open_committed()
+                prefix = self.path.read_bytes()
+                self.append_bytes(fragment)
+                s.set("b", 2)
+                # exactly the fragment was removed; the prefix is intact
+                expected = prefix + self.record_line(
+                    {"op": "set", "key": "b", "value": 2, "seq": 2}
+                )
+                self.assertEqual(self.path.read_bytes(), expected)
+                self.assertEqual(s.commit(), 2)
+                reopened = WalStore(self.path)
+                self.assertEqual(
+                    (reopened.state, reopened.commit_seq), ({"a": 1, "b": 2}, 2)
+                )
+                s.close()
+
+    def test_tail_fragment_dropped_before_delete_and_commit(self):
+        # delete: the fragment goes, the committed prefix is never rewritten
+        s = self.open_committed()
+        prefix = self.path.read_bytes()
+        self.append_bytes('{"op": "set", "key": "fra')
+        s.delete("a")
+        expected = prefix + self.record_line({"op": "delete", "key": "a", "seq": 2})
+        self.assertEqual(self.path.read_bytes(), expected)
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(WalStore(self.path).state, {})
+        s.close()
+        # commit: an empty commit drops the fragment and seals seq 2
+        self.reset_log()
+        s = self.open_committed()
+        prefix = self.path.read_bytes()
+        self.append_bytes('{"op": "set", "key": "fra')
+        self.assertEqual(s.commit(), 2)
+        expected = prefix + self.record_line({"op": "commit", "seq": 2})
+        self.assertEqual(self.path.read_bytes(), expected)
+        reopened = WalStore(self.path)
+        self.assertEqual((reopened.state, reopened.commit_seq), ({"a": 1}, 2))
+
+    def test_sync_failure_after_external_append_keeps_bytes_and_seq(self):
+        writes = {
+            "set": lambda s: s.set("c", 3),
+            "delete": lambda s: s.delete("a"),
+            "commit": lambda s: s.commit(),
+        }
+        for name, mutate in writes.items():
+            with self.subTest(write=name):
+                self.reset_log()
+                s = self.open_committed()
+                # a valid uncommitted record appended after open
+                self.append_row({"op": "set", "key": "b", "value": 2, "seq": 2})
+                before = self.path.read_bytes()
+                with mock.patch(
+                    "app.os.fsync", side_effect=OSError("disk on fire")
+                ):
+                    with self.assertRaises(OSError):
+                        mutate(s)
+                # the failed record was backed out; the external record and
+                # the committed prefix are byte-identical, no seq consumed
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+                pending = s.pending_changes()
+                self.assertEqual(pending["pending_count"], 1)
+                self.assertEqual(
+                    pending["changes"], [{"op": "set", "key": "b", "value": 2}]
+                )
+                # the transient failure does not block the seq chain
+                mutate(s)
+                if name != "commit":
+                    self.assertEqual(s.commit(), 2)
+                else:
+                    self.assertEqual(s.commit_seq, 2)
+                reopened = WalStore(self.path)
+                self.assertEqual(reopened.commit_seq, 2)
+                s.close()
+
+    def test_readonly_and_closed_priority_outranks_log_corruption(self):
+        s = self.open_committed()
+        ro = WalStore(self.path, readonly=True)
+        self.append_bytes(b"not-json\n")
+        # argument/lease checks still run before any log validation
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.set("b", 2)
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.delete("a")
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.commit()
+        ro.close()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.set("b", 2)
+        with self.assertRaises(app.WalClosedError):
+            s.commit()
 
 
 if __name__ == "__main__":
