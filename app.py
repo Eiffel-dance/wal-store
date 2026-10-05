@@ -937,6 +937,74 @@ class WalStore:
         state, _committed = self._committed_view()
         return key in state
 
+    def scan(self, start_key=None, end_key=None, limit=None):
+        """Read-only deterministic range scan over the last committed view.
+
+        Argument form is validated first, before the log is ever read:
+        start_key and end_key must be strings or omitted (None means the
+        range is unbounded on that side), start_key must not be greater
+        than end_key, and limit must be omitted (None, no cap) or a
+        non-boolean non-negative integer; any violation raises ValueError.
+        The whole log is then parsed under the exact recovery rules --
+        UTF-8, JSON objects, duplicate fields, the per-op field sets,
+        positive integer seq continuity, key/value types, and the
+        terminator adoption boundary -- with a trailing interrupted-write
+        fragment ignored exactly as recover does; any other corruption in
+        the committed region, in a terminated uncommitted record, or in an
+        unrecognisable tail raises WalCorruptionError with no partial
+        result and no change to the public state, commit_seq, or the file.
+
+        Only the last complete commit is observable: uncommitted
+        set/delete records and the unfinished tail fragment never appear.
+        The matching keys -- start_key inclusive, end_key exclusive -- are
+        ordered by Unicode code point ascending and the first limit items
+        are returned; limit 0 yields an empty list, and no match yields an
+        empty list. A missing or empty log also yields an empty list and
+        is never created. Each item carries exactly "key" and "value",
+        every value an independent deep copy, so mutating the result never
+        affects the store, a later query, or a reopened instance. The log
+        is never truncated, rewritten, or appended to, no seq is consumed,
+        and repeated scans of the same accepted log prefix -- including
+        after a reopen -- return identical items. A closed instance raises
+        WalClosedError; a read-only instance scans without taking the
+        write lease, and an exclusive instance's scan neither releases nor
+        alters its lease.
+        """
+        self._check_open()
+        if start_key is not None and not isinstance(start_key, str):
+            raise ValueError(
+                "start_key must be a string or None, got %r"
+                % (type(start_key).__name__,)
+            )
+        if end_key is not None and not isinstance(end_key, str):
+            raise ValueError(
+                "end_key must be a string or None, got %r"
+                % (type(end_key).__name__,)
+            )
+        if start_key is not None and end_key is not None and start_key > end_key:
+            raise ValueError(
+                "start_key %r exceeds end_key %r" % (start_key, end_key)
+            )
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError(
+                "limit must be a non-negative integer or None, got %r" % (limit,)
+            )
+        state, _committed = self._committed_view()
+        items = []
+        for key in sorted(state):
+            if limit is not None and len(items) >= limit:
+                break
+            if start_key is not None and key < start_key:
+                continue
+            if end_key is not None and key >= end_key:
+                # Keys are visited in ascending order, so no later key can
+                # fall below the exclusive end bound again.
+                break
+            items.append({"key": key, "value": copy.deepcopy(state[key])})
+        return items
+
     def snapshot(self, target_seq=None):
         """Read-only view of the committed state at a past commit boundary.
 

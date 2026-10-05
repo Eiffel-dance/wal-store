@@ -747,6 +747,244 @@ class QueryTest(unittest.TestCase):
         self.assertIs(s.contains("other"), False)
 
 
+class ScanTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def log_bytes(self):
+        return self.path.read_bytes() if self.path.exists() else b""
+
+    def committed_store(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1, 2]})
+        s.set("c", "x")
+        s.commit()
+        return s
+
+    def test_missing_log_scans_empty_and_creates_nothing(self):
+        s = WalStore(self.path)
+        self.assertEqual(s.scan(), [])
+        self.assertEqual(s.scan("a", "z", 5), [])
+        self.assertFalse(self.path.exists())
+
+    def test_empty_log_scans_empty(self):
+        self.path.write_bytes(b"")
+        s = WalStore(self.path)
+        self.assertEqual(s.scan(), [])
+
+    def test_full_scan_is_code_point_ordered(self):
+        s = WalStore(self.path)
+        for key in ("b", "a", "Z", "é", "中", "aa", ""):
+            s.set(key, key)
+        s.commit()
+        keys = [item["key"] for item in s.scan()]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(keys, ["", "Z", "a", "aa", "b", "é", "中"])
+        self.assertEqual(
+            s.scan(), [{"key": k, "value": k} for k in keys]
+        )
+
+    def test_start_inclusive_end_exclusive(self):
+        s = self.committed_store()
+        self.assertEqual(
+            s.scan("b"),
+            [{"key": "b", "value": {"n": [1, 2]}}, {"key": "c", "value": "x"}],
+        )
+        self.assertEqual(s.scan(end_key="b"), [{"key": "a", "value": 1}])
+        self.assertEqual(s.scan("b", "c"), [{"key": "b", "value": {"n": [1, 2]}}])
+        # an empty range (start == end) matches nothing
+        self.assertEqual(s.scan("b", "b"), [])
+        self.assertEqual(s.scan("x", "z"), [])
+        self.assertEqual(s.scan("a", "a"), [])
+
+    def test_limit_caps_after_sorting(self):
+        s = self.committed_store()
+        self.assertEqual(s.scan(limit=2), [{"key": "a", "value": 1}, {"key": "b", "value": {"n": [1, 2]}}])
+        self.assertEqual(s.scan(limit=99), s.scan())
+        self.assertEqual(s.scan("b", limit=1), [{"key": "b", "value": {"n": [1, 2]}}])
+        self.assertEqual(s.scan(limit=0), [])
+        self.assertEqual(s.scan("a", "z", 0), [])
+
+    def test_no_match_returns_empty_list(self):
+        s = self.committed_store()
+        self.assertEqual(s.scan("y"), [])
+        self.assertEqual(s.scan(end_key="a"), [])
+
+    def test_argument_validation(self):
+        s = self.committed_store()
+        for bad in (1, 1.5, b"a", ["a"], {"a": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.scan(bad)
+            with self.assertRaises(ValueError, msg=bad):
+                s.scan(end_key=bad)
+        with self.assertRaises(ValueError):
+            s.scan("b", "a")
+        for bad in (-1, 1.5, "2", True, False, [1]):
+            with self.assertRaises(ValueError, msg=bad):
+                s.scan(limit=bad)
+        # rejected calls change nothing and the store keeps working
+        self.assertEqual(len(s.scan()), 3)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": {"n": [1, 2]}, "c": "x"}, 1))
+
+    def test_arguments_rejected_before_log_is_read(self):
+        s = self.committed_store()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"}\n')  # corrupt terminated record
+        # ValueError from argument validation wins over WalCorruptionError
+        with self.assertRaises(ValueError):
+            s.scan(1)
+        with self.assertRaises(ValueError):
+            s.scan("z", "a")
+        with self.assertRaises(ValueError):
+            s.scan(limit=-1)
+        with self.assertRaises(ValueError):
+            s.scan(limit=True)
+        # valid arguments surface the corruption
+        with self.assertRaises(WalCorruptionError):
+            s.scan()
+
+    def test_uncommitted_changes_and_tail_fragment_are_invisible(self):
+        s = self.committed_store()
+        s.set("d", 4)
+        s.delete("a")
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "z", "value": 9')  # interrupted write
+        size = self.log_size()
+        self.assertEqual(
+            s.scan(),
+            [
+                {"key": "a", "value": 1},
+                {"key": "b", "value": {"n": [1, 2]}},
+                {"key": "c", "value": "x"},
+            ],
+        )
+        self.assertEqual(self.log_size(), size)  # fragment left in place
+        s.commit()
+        self.assertEqual(
+            s.scan(),
+            [
+                {"key": "b", "value": {"n": [1, 2]}},
+                {"key": "c", "value": "x"},
+                {"key": "d", "value": 4},
+            ],
+        )
+
+    def test_corruption_raises_without_partial_result(self):
+        corrupt_tails = (
+            '{"op": "set", "key": "x"}\n',  # bad field set, terminated
+            '{"op": "set", "key": "x", "value": 1, "seq": 5}\n',  # seq break
+            'not json\n',
+            '{"op": "set", "key": "x", "value": NaN, "seq": 2}\n',
+            '\n',  # empty record
+        )
+        for tail in corrupt_tails:
+            self.write_lines(
+                {"op": "set", "key": "a", "value": 1, "seq": 1},
+                {"op": "commit", "seq": 1},
+            )
+            s = WalStore(self.path)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(tail)
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                s.scan()
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                s.scan("a", "z", 10)
+            # no partial replay replaced the committed in-memory state
+            self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+    def test_values_are_independent_deep_copies(self):
+        s = self.committed_store()
+        items = s.scan()
+        items[1]["value"]["n"].append(99)
+        items[1]["key"] = "mutated"
+        self.assertEqual(s.state["b"], {"n": [1, 2]})
+        self.assertEqual(s.scan("b", "c"), [{"key": "b", "value": {"n": [1, 2]}}])
+        self.assertEqual(
+            WalStore(self.path).scan("b", "c"), [{"key": "b", "value": {"n": [1, 2]}}]
+        )
+
+    def test_scan_does_not_touch_log_state_or_seq(self):
+        s = self.committed_store()
+        s.set("pending", 1)
+        before = self.log_bytes()
+        first = s.scan()
+        for _ in range(3):
+            self.assertEqual(s.scan(), first)
+            self.assertEqual(s.scan("a", "c", 1), [{"key": "a", "value": 1}])
+        self.assertEqual(self.log_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": {"n": [1, 2]}, "c": "x"}, 1))
+        self.assertEqual(s.recover()["pending_count"], 1)
+
+    def test_deterministic_across_reopen(self):
+        s = self.committed_store()
+        expected = s.scan("a", "c", 5)
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.scan("a", "c", 5), expected)
+        self.assertEqual(s2.scan(), s.scan())
+
+    def test_closed_instance_raises(self):
+        s = self.committed_store()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.scan()
+        s.close()  # close stays idempotent
+
+    def test_readonly_scans_without_lease(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(ro.scan(), [{"key": "a", "value": 1}])
+        # the exclusive lease is unaffected by a scan on either instance
+        self.assertEqual(s.scan(), [{"key": "a", "value": 1}])
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        s.close()
+        ro.close()
+
+    def test_mutations_keep_working_after_scan(self):
+        s = self.committed_store()
+        self.assertEqual(len(s.scan()), 3)
+        s.set("d", 4)
+        s.rollback()
+        s.set("d", 4)
+        s.commit()
+        self.assertEqual(s.scan("c"), [{"key": "c", "value": "x"}, {"key": "d", "value": 4}])
+        self.assertEqual(s.apply_batch(2, [{"op": "delete", "key": "a"}]), 3)
+        self.assertEqual(s.restore(1), 4)
+        self.assertEqual(s.scan(limit=2), [{"key": "a", "value": 1}, {"key": "b", "value": {"n": [1, 2]}}])
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "z"')  # unfinished fragment
+        self.assertEqual(s.repair_tail()["removed_bytes"], len('{"op": "set", "key": "z"'))
+        self.assertEqual(len(s.scan()), 3)
+
+    def test_legacy_log_scans_without_migration(self):
+        self.write_lines(
+            {"op": "set", "key": "k1", "value": [1], "seq": 1},
+            {"op": "set", "key": "k2", "value": 2, "seq": 1},
+            {"op": "commit", "seq": 1},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.scan("k1", "k3"),
+            [{"key": "k1", "value": [1]}, {"key": "k2", "value": 2}],
+        )
+
+
 class SnapshotTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
