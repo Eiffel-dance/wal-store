@@ -4919,5 +4919,351 @@ class PreAppendRevalidationTest(unittest.TestCase):
         s.close()
 
 
+class IntegrityTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def protected_store(self, **kw):
+        kw.setdefault("integrity", True)
+        return WalStore(self.path, **kw)
+
+    def make_protected_log(self):
+        if self.path.exists():
+            self.path.unlink()
+        s = self.protected_store()
+        s.set("a", 1)
+        s.set("b", 2)
+        s.commit()
+        s.set("c", 3)
+        s.commit()
+        s.close()
+
+    def log_lines(self):
+        return self.path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    def test_integrity_param_must_be_bool(self):
+        for bad in (1, 0, "yes", None, 1.0):
+            with self.assertRaises(ValueError, msg=bad):
+                WalStore(self.path, integrity=bad)
+        self.assertFalse(self.path.exists())
+
+    def test_empty_log_starts_protected_chain(self):
+        s = self.protected_store()
+        s.set("a", 1)
+        self.assertEqual(s.commit(), 1)
+        s.close()
+        rows = [json.loads(line) for line in self.log_lines()]
+        self.assertTrue(all("mac" in row for row in rows))
+        self.assertEqual(
+            [{k: v for k, v in row.items() if k != "mac"} for row in rows],
+            [
+                {"op": "set", "key": "a", "value": 1, "seq": 1},
+                {"op": "commit", "seq": 1},
+            ],
+        )
+
+    def test_integrity_true_on_unprotected_log_raises(self):
+        s = WalStore(self.path)
+        s.set("x", 1)
+        s.commit()
+        s.close()
+        before = self.path.read_bytes()
+        for kw in ({}, {"readonly": True}, {"exclusive": True}):
+            with self.assertRaises(app.WalIntegrityError, msg=kw):
+                WalStore(self.path, integrity=True, **kw)
+        # nothing created, truncated, appended, or otherwise changed
+        self.assertEqual(self.path.read_bytes(), before)
+        # default mode keeps reading and writing the old format
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"x": 1}, 1))
+        s2.set("y", 2)
+        self.assertEqual(s2.commit(), 2)
+        s2.close()
+        rows = [json.loads(line) for line in self.log_lines()]
+        self.assertTrue(all("mac" not in row for row in rows))
+
+    def test_protected_log_stays_protected_in_default_mode(self):
+        self.make_protected_log()
+        s = WalStore(self.path)  # default mode
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2, "c": 3}, 2))
+        s.set("d", 4)
+        self.assertEqual(s.commit(), 3)
+        s.close()
+        rows = [json.loads(line) for line in self.log_lines()]
+        self.assertTrue(all("mac" in row for row in rows))
+        s2 = self.protected_store()
+        self.assertEqual((s2.state, s2.commit_seq),
+                         ({"a": 1, "b": 2, "c": 3, "d": 4}, 3))
+        s2.close()
+
+    def test_content_rewrite_detected(self):
+        self.make_protected_log()
+        data = bytearray(self.path.read_bytes())
+        i = bytes(data).index(b'"a"')
+        data[i + 1] = ord("z")
+        self.path.write_bytes(bytes(data))
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, integrity=True)
+
+    def test_record_deletion_detected(self):
+        self.make_protected_log()
+        lines = self.log_lines()
+        self.path.write_text("".join(lines[:1] + lines[2:]), encoding="utf-8")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_record_insertion_detected(self):
+        self.make_protected_log()
+        lines = self.log_lines()
+        self.path.write_text(
+            "".join(lines[:2] + lines[1:2] + lines[2:]), encoding="utf-8"
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_record_reorder_detected(self):
+        self.make_protected_log()
+        lines = self.log_lines()
+        lines[0], lines[1] = lines[1], lines[0]
+        self.path.write_text("".join(lines), encoding="utf-8")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_mac_field_rewrite_detected(self):
+        self.make_protected_log()
+        lines = self.log_lines()
+        row = json.loads(lines[0])
+        row["mac"] = "0" * 64
+        lines[0] = json.dumps(row, sort_keys=True) + "\n"
+        self.path.write_text("".join(lines), encoding="utf-8")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_unprotected_record_in_protected_log_rejected(self):
+        self.make_protected_log()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "set", "key": "z", "value": 9, "seq": 3}))
+            f.write("\n")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_protected_record_in_unprotected_log_rejected(self):
+        s = WalStore(self.path)
+        s.set("x", 1)
+        s.commit()
+        s.close()
+        other = Path(self.dir.name) / "other.wal"
+        o = WalStore(other, integrity=True)
+        o.set("y", 2)
+        o.commit()
+        o.close()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(other.read_text(encoding="utf-8").splitlines()[0])
+            f.write("\n")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_all_entries_verify_before_producing_results(self):
+        self.make_protected_log()
+        data = bytearray(self.path.read_bytes())
+        i = bytes(data).index(b'"b"')
+        data[i + 1] = ord("z")
+        self.path.write_bytes(bytes(data))
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        # a live instance opened before the tamper also fails everywhere
+        self.make_protected_log()
+        live = WalStore(self.path)
+        data = bytearray(self.path.read_bytes())
+        i = bytes(data).index(b'"b"')
+        data[i + 1] = ord("z")
+        self.path.write_bytes(bytes(data))
+        for call in (
+            lambda: live.recover(),
+            lambda: live.audit(),
+            lambda: live.pending_changes(),
+            lambda: live.snapshot(),
+            lambda: live.history(),
+            lambda: live.diff(0, 1),
+            lambda: live.scan(),
+            lambda: live.get("a"),
+            lambda: live.contains("a"),
+            lambda: live.set("q", 1),
+            lambda: live.delete("a"),
+            lambda: live.commit(),
+            lambda: live.rollback(),
+            lambda: live.repair_tail(),
+            lambda: live.restore(1),
+            lambda: live.apply_batch(2, []),
+        ):
+            with self.assertRaises(WalCorruptionError):
+                call()
+        # no partial adoption, no file change, no state change
+        self.assertEqual((live.state, live.commit_seq), ({"a": 1, "b": 2, "c": 3}, 2))
+        self.assertEqual(self.path.read_bytes(), bytes(data))
+        live.close()
+
+    def test_uncommitted_tail_and_rollback(self):
+        self.make_protected_log()
+        s = WalStore(self.path)
+        s.set("d", 4)
+        s.close()  # durable but uncommitted
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2, "c": 3}, 2))
+        r = s2.pending_changes()
+        self.assertEqual(r["pending_count"], 1)
+        self.assertEqual(r["changes"], [{"op": "set", "key": "d", "value": 4}])
+        self.assertEqual(s2.rollback(), 1)
+        s3 = self.protected_store()
+        self.assertEqual(s3.pending_changes()["pending_count"], 0)
+        self.assertEqual(s3.commit_seq, 2)
+        s2.close()
+        s3.close()
+
+    def test_tail_fragment_repair_and_continue(self):
+        self.make_protected_log()
+        size = self.path.stat().st_size
+        with self.path.open("ab") as f:
+            f.write(b'{"key": "zz", "mac": "abc')
+        s = self.protected_store()
+        a = s.audit()
+        self.assertEqual(a["tail_bytes"], self.path.stat().st_size - size)
+        r = s.repair_tail()
+        self.assertEqual(r["removed_bytes"], a["tail_bytes"])
+        self.assertEqual(self.path.stat().st_size, size)
+        s.set("e", 5)
+        self.assertEqual(s.commit(), 3)
+        s.close()
+        rows = [json.loads(line) for line in self.log_lines()]
+        self.assertTrue(all("mac" in row for row in rows))
+
+    def test_integrity_mismatch_in_tail_is_corruption_not_fragment(self):
+        self.make_protected_log()
+        s = WalStore(self.path)
+        s.set("d", 4)
+        s.close()
+        data = bytearray(self.path.read_bytes()[:-1])  # drop final newline
+        i = bytes(data).rindex(b"4")
+        data[i] = ord("5")  # tamper the unterminated record's value
+        self.path.write_bytes(bytes(data))
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        # repair_tail refuses as well: integrity mismatch is never a fragment
+        self.make_protected_log()
+        live = WalStore(self.path)
+        live.set("d", 4)
+        live.close()
+        live2 = WalStore(self.path)
+        data = bytearray(self.path.read_bytes()[:-1])
+        i = bytes(data).rindex(b"4")
+        data[i] = ord("5")
+        self.path.write_bytes(bytes(data))
+        with self.assertRaises(WalCorruptionError):
+            live2.repair_tail()
+        live2.close()
+
+    def test_readonly_integrity_verifies_but_cannot_write(self):
+        self.make_protected_log()
+        r = WalStore(self.path, readonly=True, integrity=True)
+        self.assertEqual((r.state, r.commit_seq), ({"a": 1, "b": 2, "c": 3}, 2))
+        self.assertEqual(r.snapshot(1)["state"], {"a": 1, "b": 2})
+        self.assertEqual([h["commit_seq"] for h in r.history()], [1, 2])
+        self.assertEqual(
+            r.diff(1, 2)["changes"], [{"op": "set", "key": "c", "value": 3}]
+        )
+        self.assertEqual(r.scan(limit=1), [{"key": "a", "value": 1}])
+        for call in (
+            lambda: r.set("q", 1),
+            lambda: r.delete("a"),
+            lambda: r.commit(),
+            lambda: r.rollback(),
+            lambda: r.restore(1),
+            lambda: r.apply_batch(2, []),
+            lambda: r.repair_tail(),
+        ):
+            with self.assertRaises(app.WalReadOnlyError):
+                call()
+        r.close()
+
+    def test_exclusive_integrity_lease_and_writes(self):
+        e1 = WalStore(self.path, exclusive=True, integrity=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True, integrity=True)
+        e1.set("a", 1)
+        self.assertEqual(e1.commit(), 1)
+        e1.close()
+        rows = [json.loads(line) for line in self.log_lines()]
+        self.assertTrue(all("mac" in row for row in rows))
+
+    def test_restore_and_apply_batch_keep_chain(self):
+        self.make_protected_log()
+        s = self.protected_store()
+        self.assertEqual(s.restore(1), 3)
+        self.assertEqual(s.state, {"a": 1, "b": 2})
+        seq = s.apply_batch(3, [{"op": "set", "key": "k", "value": [1, 2]},
+                                {"op": "delete", "key": "a"}])
+        self.assertEqual(seq, 4)
+        self.assertEqual(s.state, {"b": 2, "k": [1, 2]})
+        s.close()
+        rows = [json.loads(line) for line in self.log_lines()]
+        self.assertTrue(all("mac" in row for row in rows))
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"b": 2, "k": [1, 2]}, 4))
+        self.assertEqual(s2.snapshot(2)["state"], {"a": 1, "b": 2, "c": 3})
+        s2.close()
+
+    def test_results_are_isolated_deep_copies(self):
+        self.make_protected_log()
+        s = self.protected_store()
+        s.set("n", {"list": [1]})
+        s.commit()
+        r = s.recover()
+        r["state"]["n"]["list"].append(2)
+        snap = s.snapshot()
+        snap["state"]["n"]["list"].append(3)
+        self.assertEqual(s.state["n"], {"list": [1]})
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.state["n"], {"list": [1]})
+        s.close()
+        s2.close()
+
+    def test_failed_write_consumes_no_seq_and_retry_is_consistent(self):
+        s = self.protected_store()
+        s.set("a", 1)
+        s.commit()
+        real_fsync = app.os.fsync
+        calls = {"n": 0}
+
+        def flaky(fd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(5, "injected")
+            return real_fsync(fd)
+
+        app.os.fsync = flaky
+        try:
+            with self.assertRaises(OSError):
+                s.set("b", 2)
+        finally:
+            app.os.fsync = real_fsync
+        self.assertEqual(s.commit_seq, 1)
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s.close()
+        s2 = self.protected_store()
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+        s2.close()
+
+    def test_exception_types_are_distinct(self):
+        self.assertFalse(issubclass(app.WalIntegrityError, WalCorruptionError))
+        self.assertFalse(issubclass(WalCorruptionError, app.WalIntegrityError))
+
+
 if __name__ == "__main__":
     unittest.main()

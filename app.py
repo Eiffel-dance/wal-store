@@ -13,6 +13,17 @@ class WalCorruptionError(ValueError):
     """Raised when the write-ahead log fails validation."""
 
 
+class WalIntegrityError(Exception):
+    """Raised when integrity mode is requested for an unprotected log.
+
+    integrity=True is only valid for a missing/empty log (which then starts
+    a protected chain) or a log whose records already carry integrity
+    metadata. Opening a non-empty, completely unprotected log with
+    integrity=True raises this error without creating, truncating,
+    appending, or changing any in-memory state.
+    """
+
+
 class WalBusyError(Exception):
     """Raised when an exclusive write lease is already held for the log path."""
 
@@ -60,6 +71,34 @@ _SCHEMAS = {
     "delete": {"op", "key", "seq"},
     "commit": {"op", "seq"},
 }
+
+# Extra field carried by every record of an integrity-protected log.
+_INTEGRITY_FIELDS = frozenset({"mac"})
+
+# Chain value feeding the first protected record's mac; a protected log is
+# recognised by its records carrying "mac", never by a header record, so an
+# empty log and a protected log share no on-disk marker.
+_INTEGRITY_GENESIS = "0" * 64
+
+
+def _record_mac(prev_mac, content):
+    """Chained integrity mac for one protected record.
+
+    The mac covers the record's full content (op, key, value, and the
+    stamped commit seq) and the previous record's mac, so content
+    rewriting, record deletion, insertion, and reordering all break the
+    chain at the first tampered position. The canonical form is computed
+    from the parsed record, so it is identical for the writer and for any
+    later verifier.
+    """
+    digest = hashlib.sha256()
+    digest.update(prev_mac.encode("ascii"))
+    digest.update(b"\x00")
+    digest.update(
+        json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return digest.hexdigest()
+
 
 # bool is an int subclass but remains acceptable (it round-trips as JSON
 # true/false).
@@ -219,7 +258,7 @@ _LOCK_DIR = os.path.join(tempfile.gettempdir(), "walstore_locks")
 
 
 class WalStore:
-    def __init__(self, path, exclusive=False, readonly=False):
+    def __init__(self, path, exclusive=False, readonly=False, integrity=False):
         # Validate every parameter before touching the path in any way: a
         # rejected call must never read, create, truncate, or append to the
         # log or its lock file.
@@ -230,6 +269,10 @@ class WalStore:
         if not isinstance(readonly, bool):
             raise ValueError(
                 "readonly must be a bool, got %r" % (type(readonly).__name__,)
+            )
+        if not isinstance(integrity, bool):
+            raise ValueError(
+                "integrity must be a bool, got %r" % (type(integrity).__name__,)
             )
         if exclusive and readonly:
             raise ValueError(
@@ -244,6 +287,15 @@ class WalStore:
         self._valid_size = None
         self._closed = False
         self._readonly = readonly
+        # Integrity mode requested at open time. The log's actual protection
+        # is recognised from its records during every replay: _log_protected
+        # is None while no record has been seen (missing or empty log), True
+        # for a protected log, False for an unprotected one; _last_mac is the
+        # chain value of the last accepted protected record. Both are only
+        # consulted by _append immediately after a fresh revalidating replay.
+        self._integrity = integrity
+        self._log_protected = None
+        self._last_mac = _INTEGRITY_GENESIS
         # Legacy per-normalized-path lease descriptor (kept for the exact
         # historical sibling-lock behaviour) plus the real-object identity
         # lease descriptors:
@@ -583,7 +635,7 @@ class WalStore:
         ``committed + 1`` rather than any seq cached at open time.
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        saved_boundary = self._valid_size
+        saved_boundary = (self._valid_size, self._log_protected, self._last_mac)
         try:
             (
                 candidate,
@@ -608,7 +660,7 @@ class WalStore:
             # adopts a boundary: state, commit_seq, and the cached
             # accepted-prefix edge stay exactly as on entry. Every later
             # write revalidates from the head in any case.
-            self._valid_size = saved_boundary
+            (self._valid_size, self._log_protected, self._last_mac) = saved_boundary
             raise
         return candidate, committed
 
@@ -631,6 +683,18 @@ class WalStore:
         candidate, committed = self._revalidate_for_append()
         record = dict(row)
         record["seq"] = committed + 1
+        # The revalidating replay has just re-recognised the log's
+        # protection: a protected log keeps its protected format in every
+        # mode, an unprotected log keeps its plain format in the default
+        # mode, and an empty log starts a protected chain exactly when the
+        # store was opened with integrity=True. (integrity=True on a
+        # non-empty unprotected log has already raised WalIntegrityError
+        # inside the replay.)
+        protected = self._log_protected
+        if protected is None:
+            protected = self._integrity
+        if protected:
+            record["mac"] = _record_mac(self._last_mac, record)
         line = json.dumps(record, sort_keys=True) + "\n"
         created = not self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
@@ -1055,11 +1119,13 @@ class WalStore:
         # decision to drop a tail fragment. The committed view contains
         # only the last complete commit: pending records and a discarded
         # tail fragment are invisible by construction.
-        saved_valid_size = self._valid_size
+        saved_valid_size = (self._valid_size, self._log_protected, self._last_mac)
         try:
             state, _committed = self._committed_view()
         finally:
-            self._valid_size = saved_valid_size
+            (self._valid_size, self._log_protected, self._last_mac) = (
+                saved_valid_size
+            )
         # Sort by Unicode code point first, then apply the half-open
         # [start_key, end_key) window and the limit cap in that order, so
         # limit always means the first limit ordered matches.
@@ -1256,13 +1322,15 @@ class WalStore:
         # accepted-prefix boundary so an observational diff can never
         # influence a later append's decision to drop a tail fragment.
         history_views = []
-        saved_valid_size = self._valid_size
+        saved_valid_size = (self._valid_size, self._log_protected, self._last_mac)
         try:
             _candidate, committed, _pending, _valid_size, _committed_size = (
                 self._replay(snapshots=history_views)
             )
         finally:
-            self._valid_size = saved_valid_size
+            (self._valid_size, self._log_protected, self._last_mac) = (
+                saved_valid_size
+            )
         if from_seq > committed:
             raise ValueError(
                 "from_seq %r exceeds latest committed seq %r"
@@ -1332,7 +1400,7 @@ class WalStore:
         # The replay itself builds only local objects and never touches
         # self.state, so WalCorruptionError propagates with nothing
         # adopted.
-        saved_valid_size = self._valid_size
+        saved_valid_size = (self._valid_size, self._log_protected, self._last_mac)
         try:
             (
                 _candidate,
@@ -1342,7 +1410,9 @@ class WalStore:
                 _committed_size,
             ) = self._replay(pending_out=changes)
         finally:
-            self._valid_size = saved_valid_size
+            (self._valid_size, self._log_protected, self._last_mac) = (
+                saved_valid_size
+            )
         return RecoveryResult(
             commit_seq=committed,
             pending_count=pending_count,
@@ -1382,7 +1452,7 @@ class WalStore:
         # later append; audit is purely observational and must not influence
         # that decision, so restore whatever was cached before (the replay
         # itself builds only local objects and never touches self.state).
-        saved_valid_size = self._valid_size
+        saved_valid_size = (self._valid_size, self._log_protected, self._last_mac)
         try:
             (
                 candidate,
@@ -1392,7 +1462,9 @@ class WalStore:
                 committed_size,
             ) = self._replay()
         finally:
-            self._valid_size = saved_valid_size
+            (self._valid_size, self._log_protected, self._last_mac) = (
+                saved_valid_size
+            )
         file_size = self.path.stat().st_size if self.path.exists() else 0
         return RecoveryResult(
             state=copy.deepcopy(candidate),
@@ -1495,6 +1567,13 @@ class WalStore:
         # Byte offset just past the last durable commit record (0 when there
         # is no committed prefix); rollback truncates at exactly this point.
         committed_size = 0
+        # Log protection is recognised from the records themselves: the
+        # first record fixes the mode (carrying "mac" or not), and every
+        # later record must match it -- a protected record in an unprotected
+        # log or a plain record in a protected log is an illegal mix and
+        # fails the field-set check below. None means no record seen yet.
+        protected = None
+        last_mac = _INTEGRITY_GENESIS
         if self.path.exists():
             data = self.path.read_bytes()
             try:
@@ -1559,7 +1638,10 @@ class WalStore:
                 schema = _SCHEMAS.get(op)
                 if schema is None:
                     raise WalCorruptionError("unknown op: %r" % (op,))
-                if set(row) != schema:
+                if protected is None:
+                    protected = "mac" in row
+                expected = (schema | _INTEGRITY_FIELDS) if protected else schema
+                if set(row) != expected:
                     raise WalCorruptionError(
                         "bad fields for op %r: %r" % (op, sorted(row))
                     )
@@ -1583,6 +1665,27 @@ class WalStore:
                         raise
                     except ValueError as exc:
                         raise WalCorruptionError(str(exc)) from exc
+                if protected:
+                    # Verify the chained mac over the record's full content
+                    # (op, key, value, seq) and the previous record's mac:
+                    # content rewriting, record deletion, insertion, and
+                    # reordering all surface here as a mismatch. This check
+                    # runs before the unterminated-fragment break below, so a
+                    # complete record whose terminator is missing only counts
+                    # as a discardable interrupted-write fragment when its
+                    # integrity metadata also verifies; an integrity mismatch
+                    # is always corruption, never a repairable fragment.
+                    mac = row["mac"]
+                    if not isinstance(mac, str):
+                        raise WalCorruptionError(
+                            "integrity mac is not a string: %r" % (mac,)
+                        )
+                    content = {k: v for k, v in row.items() if k != "mac"}
+                    if mac != _record_mac(last_mac, content):
+                        raise WalCorruptionError(
+                            "integrity check failed for record seq %r" % (seq,)
+                        )
+                    last_mac = mac
                 if not terminated:
                     # The record's terminator never became durable, so the
                     # write is unfinished: the fragment is discarded whole --
@@ -1645,7 +1748,20 @@ class WalStore:
                             "value": copy.deepcopy(p["value"]),
                         }
                     )
+        if self._integrity and protected is False:
+            # integrity=True only opens a missing/empty log (which starts a
+            # protected chain on first write) or an already-protected log. A
+            # non-empty, completely unprotected log is refused here -- after
+            # the whole log has otherwise validated, before any boundary is
+            # adopted -- without creating, truncating, appending, or changing
+            # in-memory state. An illegal mix of protected and unprotected
+            # records never reaches this point: it is WalCorruptionError.
+            raise WalIntegrityError(
+                "log is not integrity-protected: %r" % (str(self.path),)
+            )
         self._valid_size = valid_size
+        self._log_protected = protected
+        self._last_mac = last_mac
         return candidate, committed, len(pending), valid_size, committed_size
 
     def recover(self):
