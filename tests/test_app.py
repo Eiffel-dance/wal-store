@@ -2144,6 +2144,288 @@ class HistoryTest(unittest.TestCase):
         )
 
 
+class DiffTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()  # seq 1: {a: 1, b: {n: [1]}}
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()  # seq 2: {b: {n: [1]}, c: 3}
+        s.commit()  # seq 3: empty commit, same state as seq 2
+        s.set("tail", 9)  # uncommitted
+        return s
+
+    def test_basic_diff_between_commits(self):
+        s = self.build()
+        self.assertEqual(
+            s.diff(1, 2),
+            {
+                "from_seq": 1,
+                "to_seq": 2,
+                "changes": [
+                    {"op": "delete", "key": "a"},
+                    {"op": "set", "key": "c", "value": 3},
+                ],
+            },
+        )
+        # the reverse direction of time is not expressible (from <= to),
+        # but any earlier baseline works, including the empty object
+        self.assertEqual(
+            s.diff(0, 1),
+            {
+                "from_seq": 0,
+                "to_seq": 1,
+                "changes": [
+                    {"op": "set", "key": "a", "value": 1},
+                    {"op": "set", "key": "b", "value": {"n": [1]}},
+                ],
+            },
+        )
+        self.assertEqual(
+            s.diff(0, 2)["changes"],
+            [
+                {"op": "set", "key": "b", "value": {"n": [1]}},
+                {"op": "set", "key": "c", "value": 3},
+            ],
+        )
+
+    def test_identical_states_yield_empty_changes(self):
+        s = self.build()
+        for args in ((0, 0), (1, 1), (2, 2), (2, 3), (3, 3)):
+            result = s.diff(*args)
+            self.assertEqual(result["changes"], [], msg=args)
+            self.assertEqual(result["from_seq"], args[0])
+            self.assertEqual(result["to_seq"], args[1])
+
+    def test_empty_and_nonexistent_log(self):
+        s = WalStore(self.path)  # path does not exist
+        self.assertEqual(
+            s.diff(0, 0), {"from_seq": 0, "to_seq": 0, "changes": []}
+        )
+        self.assertFalse(self.path.exists())  # no file is created
+        self.path.write_bytes(b"")
+        self.assertEqual(s.diff(0, 0)["changes"], [])
+        # any positive seq exceeds the latest committed seq of 0
+        with self.assertRaises(ValueError):
+            s.diff(0, 1)
+        with self.assertRaises(ValueError):
+            s.diff(1, 1)
+
+    def test_invalid_arguments_raise_valueerror(self):
+        s = self.build()
+        for bad in (True, False, -1, 1.0, "1", b"1", [1], {"s": 1}, None):
+            with self.assertRaises(ValueError, msg=bad):
+                s.diff(bad, 0)
+            with self.assertRaises(ValueError, msg=bad):
+                s.diff(0, bad)
+        with self.assertRaises(ValueError):
+            s.diff(2, 1)  # inverted range
+        with self.assertRaises(ValueError):
+            s.diff(1, 0)
+
+    def test_argument_errors_precede_log_validation(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # corrupt record
+        with self.assertRaises(ValueError):
+            s.diff(-1, 0)
+        with self.assertRaises(ValueError):
+            s.diff(True, 1)
+        with self.assertRaises(ValueError):
+            s.diff(3, 1)
+        with self.assertRaises(WalCorruptionError):
+            s.diff(0, 1)
+
+    def test_out_of_range_seqs_raise_valueerror(self):
+        s = self.build()  # latest committed seq is 3
+        with self.assertRaises(ValueError):
+            s.diff(4, 4)
+        with self.assertRaises(ValueError):
+            s.diff(0, 4)
+        with self.assertRaises(ValueError):
+            s.diff(0, 10**9)
+
+    def test_closed_instance_raises_closed_error_first(self):
+        s = self.build()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.diff(0, 1)
+        with self.assertRaises(app.WalClosedError):
+            s.diff(-1, 0)  # closed beats the argument form check
+        with self.assertRaises(app.WalClosedError):
+            s.diff(0, 0)
+
+    def test_uncommitted_records_never_enter_diff(self):
+        s = self.build()
+        for args in ((0, 3), (1, 2), (2, 3)):
+            for change in s.diff(*args)["changes"]:
+                self.assertNotEqual(change.get("key"), "tail")
+        # a log with only uncommitted records diffs like an empty log
+        self.write_lines({"op": "set", "key": "p", "value": 1, "seq": 1})
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.diff(0, 0)["changes"], [])
+        with self.assertRaises(ValueError):
+            s2.diff(0, 1)
+
+    def test_corruption_anywhere_raises_no_partial_result(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # invalid, terminated
+        for args in ((0, 0), (0, 1), (1, 2), (0, 3)):
+            with self.assertRaises(WalCorruptionError, msg=args):
+                s.diff(*args)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+
+    def test_tail_fragment_does_not_affect_diff(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "frag"')  # interrupted write
+        size = self.log_size()
+        self.assertEqual(
+            s.diff(1, 2)["changes"],
+            [{"op": "delete", "key": "a"}, {"op": "set", "key": "c", "value": 3}],
+        )
+        self.assertEqual(self.log_size(), size)  # fragment left in place
+
+    def test_keys_sorted_by_code_point_and_one_entry_each(self):
+        s = WalStore(self.path)
+        s.set("b", 1)
+        s.set("A", 1)
+        s.set("é", 1)
+        s.set("a", 1)
+        s.commit()  # seq 1
+        s.set("b", 2)
+        s.delete("A")
+        s.set("é", 1)  # unchanged value, no diff entry
+        s.set("z", 5)
+        s.commit()  # seq 2
+        changes = s.diff(1, 2)["changes"]
+        self.assertEqual(
+            changes,
+            [
+                {"op": "delete", "key": "A"},
+                {"op": "set", "key": "b", "value": 2},
+                {"op": "set", "key": "z", "value": 5},
+            ],
+        )
+        self.assertEqual([c["key"] for c in changes], sorted(c["key"] for c in changes))
+
+    def test_json_type_distinction_forces_set(self):
+        s = WalStore(self.path)
+        s.set("n", 1)
+        s.set("deep", {"x": [1, 2]})
+        s.commit()  # seq 1
+        s.set("n", True)  # 1 -> true: different JSON types
+        s.set("deep", {"x": [1, True]})  # boolean nested in a list
+        s.commit()  # seq 2
+        self.assertEqual(
+            s.diff(1, 2)["changes"],
+            [
+                {"op": "set", "key": "deep", "value": {"x": [1, True]}},
+                {"op": "set", "key": "n", "value": True},
+            ],
+        )
+        # numeric family: 1 and 1.0 are the same JSON number, no entry
+        s2 = WalStore(Path(self.dir.name) / "other.wal")
+        s2.set("n", 1)
+        s2.commit()
+        s2.set("n", 1.0)
+        s2.commit()
+        self.assertEqual(s2.diff(1, 2)["changes"], [])
+
+    def test_result_is_independent_deep_copy(self):
+        s = self.build()
+        result = s.diff(0, 1)
+        result["changes"][1]["value"]["n"].append(99)
+        result["changes"].append({"op": "delete", "key": "a"})
+        result["from_seq"] = 99
+        again = s.diff(0, 1)
+        self.assertEqual(again["from_seq"], 0)
+        self.assertEqual(len(again["changes"]), 2)
+        self.assertEqual(again["changes"][1]["value"], {"n": [1]})
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(WalStore(self.path).diff(0, 1), again)
+
+    def test_diff_is_read_only(self):
+        s = self.build()
+        size = self.log_size()
+        for args in ((0, 0), (0, 1), (1, 2), (2, 3), (0, 3)):
+            s.diff(*args)
+        self.assertEqual(self.log_size(), size)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.recover()["pending_count"], 1)
+        # the pending record is still appended after, not re-sequenced
+        s.commit()
+        self.assertEqual(s.commit_seq, 4)
+        self.assertEqual(s.state["tail"], 9)
+
+    def test_deterministic_across_calls_and_reopens(self):
+        s = self.build()
+        first = s.diff(0, 2)
+        for _ in range(3):
+            self.assertEqual(s.diff(0, 2), first)
+            self.assertEqual(WalStore(self.path).diff(0, 2), first)
+
+    def test_readonly_and_exclusive_instances_can_diff(self):
+        s = self.build()
+        expected = s.diff(1, 2)
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(ro.diff(1, 2), expected)
+        ex = WalStore(Path(self.dir.name) / "ex.wal", exclusive=True)
+        ex.set("k", 1)
+        ex.commit()
+        ex.set("k", 2)
+        ex.commit()
+        self.assertEqual(
+            ex.diff(1, 2)["changes"], [{"op": "set", "key": "k", "value": 2}]
+        )
+        # the exclusive lease and writability survive the diff
+        ex.set("k", 3)
+        ex.commit()
+        self.assertEqual(ex.commit_seq, 3)
+        ex.close()
+        ro.close()
+
+    def test_legacy_log_serves_diff(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "k", "value": 2, "seq": 2},
+            {"op": "delete", "key": "k", "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.diff(1, 2)["changes"], [{"op": "delete", "key": "k"}]
+        )
+        self.assertEqual(
+            s.diff(0, 1)["changes"], [{"op": "set", "key": "k", "value": 1}]
+        )
+
+
 class ExclusiveLeaseTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

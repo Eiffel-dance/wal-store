@@ -1137,6 +1137,116 @@ class WalStore:
             if since_seq < seq <= until_seq
         ]
 
+    def diff(self, from_seq, to_seq):
+        """Read-only key-level diff between two committed states.
+
+        from_seq names the baseline committed state and to_seq the target
+        state; seq 0 is the empty object on either side. Both must be
+        non-boolean non-negative integers with from_seq <= to_seq -- every
+        such form error (booleans, non-integers, negatives, an inverted
+        range) raises ValueError before the log is ever read, and a closed
+        instance raises WalClosedError before any of these checks. The
+        whole log is then validated under the exact recover rules: any
+        corruption anywhere raises WalCorruptionError with no partial
+        result, a trailing interrupted-write fragment is ignored by the
+        recover rules, and complete but uncommitted set/delete records
+        never enter the diff. Once the latest committed seq is known, a
+        from_seq or to_seq beyond it also raises ValueError; an empty log
+        (latest seq 0) therefore only accepts diff(0, 0).
+
+        Returns a RecoveryResult with from_seq, to_seq, and changes: the
+        minimal key-level modifications turning the baseline into the
+        target, at most one entry per key, sorted by Unicode code point.
+        A key added or holding a different value (compared with the
+        JSON-type-aware rules, so 1 and true -- nested or not -- differ)
+        yields {"op": "set", "key", "value"}; a key missing from the
+        target yields {"op": "delete", "key"}. Identical states yield an
+        empty changes list. The result and every nested value are
+        independent deep copies: mutating them never affects the store, a
+        later commit, or a repeated call.
+
+        The diff is purely observational: it never appends, truncates,
+        reorders, or rewrites the log, never creates a missing log file,
+        and never changes state, commit_seq, pending_count, or the cached
+        accepted-prefix boundary a later append relies on. It runs on
+        read-only instances (without taking the write lease) and on
+        exclusive instances (leaving the lease untouched), and repeated
+        calls on the same acceptable log prefix, including after a
+        reopen, return identical results.
+        """
+        # Closed takes priority, exactly as every other public query does.
+        self._check_open()
+        # Reject every argument form error before the log is ever read: a
+        # rejected call must never read, create, truncate, or append to
+        # the file.
+        if (
+            isinstance(from_seq, bool)
+            or not isinstance(from_seq, int)
+            or from_seq < 0
+        ):
+            raise ValueError(
+                "from_seq must be a non-negative integer, got %r" % (from_seq,)
+            )
+        if (
+            isinstance(to_seq, bool)
+            or not isinstance(to_seq, int)
+            or to_seq < 0
+        ):
+            raise ValueError(
+                "to_seq must be a non-negative integer, got %r" % (to_seq,)
+            )
+        if from_seq > to_seq:
+            raise ValueError(
+                "from_seq %r exceeds to_seq %r" % (from_seq, to_seq)
+            )
+        # Validate the whole log under the exact recover rules, purely
+        # into local objects: corruption raises WalCorruptionError with no
+        # partial result and no change to state or commit_seq. As in
+        # audit, scan, and pending_changes, restore the cached
+        # accepted-prefix boundary so an observational diff can never
+        # influence a later append's decision to drop a tail fragment.
+        history_views = []
+        saved_valid_size = self._valid_size
+        try:
+            _candidate, committed, _pending, _valid_size, _committed_size = (
+                self._replay(snapshots=history_views)
+            )
+        finally:
+            self._valid_size = saved_valid_size
+        if from_seq > committed:
+            raise ValueError(
+                "from_seq %r exceeds latest committed seq %r"
+                % (from_seq, committed)
+            )
+        if to_seq > committed:
+            raise ValueError(
+                "to_seq %r exceeds latest committed seq %r"
+                % (to_seq, committed)
+            )
+        # Commit seqs are contiguous from 1, so each boundary's view is
+        # exactly the snapshot recorded at that commit; 0 is the empty
+        # object. The snapshots are already deep copies private to this
+        # call.
+        views = dict(history_views)
+        base = {} if from_seq == 0 else views[from_seq]
+        target = {} if to_seq == 0 else views[to_seq]
+        # Merge the two key sets and emit deterministically in Unicode
+        # (code point) key order, at most one entry per key: a key only
+        # in the target, or present with a different value under
+        # JSON-type-aware comparison, is a set; a key present in the
+        # baseline but absent from the target is a delete.
+        changes = []
+        for key in sorted(set(base) | set(target)):
+            if key not in target:
+                changes.append({"op": "delete", "key": key})
+            elif key not in base or not _json_equal(base[key], target[key]):
+                # Deep copy: the returned value must not share objects
+                # with anything the store or a later call could mutate.
+                changes.append(
+                    {"op": "set", "key": key, "value": copy.deepcopy(target[key])}
+                )
+        return RecoveryResult(from_seq=from_seq, to_seq=to_seq, changes=changes)
+
     def pending_changes(self):
         """Read-only view of the complete uncommitted records after the last commit.
 
