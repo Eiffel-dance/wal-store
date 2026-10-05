@@ -937,6 +937,93 @@ class WalStore:
         state, _committed = self._committed_view()
         return key in state
 
+    def scan(self, start_key=None, end_key=None, limit=None):
+        """Read-only deterministic range scan of the last committed view.
+
+        Returns the committed items whose keys lie in the half-open range
+        [start_key, end_key), sorted by Unicode code point and capped at
+        limit items; each item is exactly {"key": key, "value": value} with
+        an independent deep copy of the value. An omitted bound means
+        unbounded on that side, an omitted limit means no cap, and a zero
+        limit returns an empty list. With no matching keys -- including a
+        missing or empty log -- the result is an empty list and no file is
+        created.
+
+        start_key and end_key must each be a string or omitted, start_key
+        must not exceed end_key, and limit must be a non-boolean
+        non-negative integer (or omitted); every such rejection is a
+        ValueError raised before the log is read. The whole log is then
+        validated under the exact recover rules: corruption anywhere --
+        the committed region, terminated uncommitted records, or an
+        unrecognisable tail -- raises WalCorruptionError with no partial
+        result, while a single trailing interrupted-write fragment is
+        ignored by the recover rules. Uncommitted set/delete records are
+        never visible: only the state of the last complete commit is
+        served.
+
+        The scan never appends, truncates, or rewrites the log and never
+        changes state, commit_seq, pending_count, or the cached
+        accepted-prefix boundary; a read-only instance scans without
+        taking the write lease and an exclusive instance keeps its lease
+        untouched. Repeated scans of the same acceptable log prefix,
+        including after a reopen, return exactly the same sequence.
+        """
+        # Closed takes priority, exactly as every other public query does.
+        self._check_open()
+        # Reject every argument before the log is ever read: a rejected
+        # call must never read, create, truncate, or append to the file.
+        if start_key is not None and not isinstance(start_key, str):
+            raise ValueError(
+                "start_key must be a string or omitted, got %r"
+                % (type(start_key).__name__,)
+            )
+        if end_key is not None and not isinstance(end_key, str):
+            raise ValueError(
+                "end_key must be a string or omitted, got %r"
+                % (type(end_key).__name__,)
+            )
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError(
+                "limit must be a non-negative integer or omitted, got %r"
+                % (limit,)
+            )
+        if (
+            start_key is not None
+            and end_key is not None
+            and start_key > end_key
+        ):
+            raise ValueError(
+                "start_key %r exceeds end_key %r" % (start_key, end_key)
+            )
+        # Validate the whole log under the exact recover rules, purely into
+        # local objects: corruption raises WalCorruptionError with no
+        # partial result and no change to state or commit_seq. As in audit
+        # and pending_changes, restore the cached accepted-prefix boundary
+        # so an observational scan can never influence a later append's
+        # decision to drop a tail fragment. The committed view contains
+        # only the last complete commit: pending records and a discarded
+        # tail fragment are invisible by construction.
+        saved_valid_size = self._valid_size
+        try:
+            state, _committed = self._committed_view()
+        finally:
+            self._valid_size = saved_valid_size
+        # Sort by Unicode code point first, then apply the half-open
+        # [start_key, end_key) window and the limit cap in that order, so
+        # limit always means the first limit ordered matches.
+        keys = sorted(state)
+        if start_key is not None:
+            keys = [key for key in keys if key >= start_key]
+        if end_key is not None:
+            keys = [key for key in keys if key < end_key]
+        if limit is not None:
+            keys = keys[:limit]
+        return [
+            {"key": key, "value": copy.deepcopy(state[key])} for key in keys
+        ]
+
     def snapshot(self, target_seq=None):
         """Read-only view of the committed state at a past commit boundary.
 
