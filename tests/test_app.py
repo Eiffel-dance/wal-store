@@ -2743,11 +2743,25 @@ class AliasLeaseTest(unittest.TestCase):
             with self.assertRaises(app.WalBusyError):
                 WalStore(link, exclusive=True)
         self.assertEqual(self.path.stat().st_size, size)
-        # holder keeps its own lease, state, seq, and file bytes
+        # holder keeps its own lease, state, seq, and file bytes. The
+        # out-of-band corruption is a terminated invalid record: a write now
+        # revalidates the log from the head and refuses with
+        # WalCorruptionError rather than overwriting the unknown bytes; the
+        # lease (and read-only/busy) priority is unchanged -- the loser above
+        # still got WalBusyError without ever reading the log.
         self.assertEqual(s.state, {"a": 1})
         self.assertEqual(s.commit_seq, 1)
-        s.set("b", 2)
-        self.assertEqual(s.commit(), 2)
+        with self.assertRaises(app.WalCorruptionError):
+            s.set("b", 2)
+        with self.assertRaises(app.WalCorruptionError):
+            s.delete("a")
+        with self.assertRaises(app.WalCorruptionError):
+            s.commit()
+        # nothing was appended or truncated, and no state/seq was adopted
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertTrue(self.path.read_bytes().endswith(b"not-a-record\n"))
+        self.assertEqual(s.state, {"a": 1})
+        self.assertEqual(s.commit_seq, 1)
         s.close()
 
     def test_alias_close_and_context_manager_release_identity_lease(self):
@@ -4561,6 +4575,348 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(r.removed_bytes, len(b'{"op": "set", "key": "frag"'))
         reopened = WalStore(self.path)
         self.assertEqual(reopened.scan(), s.scan())
+
+
+class PreAppendRevalidationTest(unittest.TestCase):
+    """A write must re-validate the whole log it actually sees on disk.
+
+    The store may stay open while another actor appends to or damages the
+    log. Before any byte of a set/delete/commit is appended, the store must
+    replay the log under the exact recover rules, re-determine the byte
+    boundaries and last committed seq/state, and only then append -- never
+    silently overwriting data the instance never knew about.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def base_store(self):
+        # A settled store: {"a": 1} committed at seq 1, left open while the
+        # test mutates the file out of band.
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        return s
+
+    def record(self, row):
+        return (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+
+    # ----- category 1: external corruption blocks every write ----------------
+
+    def test_external_corruption_blocks_set_delete_commit_without_change(self):
+        corrupt_tails = [
+            b'{"op": "set", "key": "x"}\n',        # parseable, missing value
+            b"not-a-record\n",                     # terminated invalid JSON
+            b"\n",                                 # blank record line
+            b"   \n",                              # whitespace-only record
+            b"\xff",                               # illegal UTF-8
+            b'{"op": "set", "op": "set", "key": "q", "value": 1, "seq": 2}\n',
+            b'{"op": "set", "key": "q", "seq": 2}\n',  # missing field
+            b'{"op": "bogus", "seq": 2}\n',        # unknown op
+            b'{"op": "set", "key": "q", "value": 1, "seq": 5}\n',  # seq jump
+            b'{"op": "set", "key": 1, "value": 1, "seq": 2}\n',    # bad key
+            b'{"op": "set", "key": "q", "value": NaN, "seq": 2}\n',  # NaN
+            b'{"op": "set", "key": "q", "value": 1, "seq": 2}extra\n',
+        ]
+        s = self.base_store()
+        good_prefix = self.path.read_bytes()
+        for tail in corrupt_tails:
+            self.path.write_bytes(good_prefix + tail)
+            size = self.path.stat().st_size
+            raw = self.path.read_bytes()
+            for action in (
+                lambda: s.set("b", 2),
+                lambda: s.delete("a"),
+                lambda: s.commit(),
+            ):
+                with self.assertRaises(WalCorruptionError, msg=tail):
+                    action()
+                # no append, no truncation, no adopted state or seq
+                self.assertEqual(self.path.read_bytes(), raw, msg=tail)
+                self.assertEqual(self.path.stat().st_size, size, msg=tail)
+                self.assertEqual(s.state, {"a": 1}, msg=tail)
+                self.assertEqual(s.commit_seq, 1, msg=tail)
+            # rollback sees the same boundary: it validates before touching
+            # bytes, so the corrupt file is left exactly in place
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                s.rollback()
+            self.assertEqual(self.path.read_bytes(), raw, msg=tail)
+            # a reopen on the damaged log is rejected the same way
+            with self.assertRaises(WalCorruptionError, msg=tail):
+                WalStore(self.path)
+
+    def test_corruption_does_not_latch_once_file_is_restored(self):
+        s = self.base_store()
+        good_prefix = self.path.read_bytes()
+        self.append_bytes(b'{"op": "set", "key": "x"}\n')
+        with self.assertRaises(WalCorruptionError):
+            s.set("b", 2)
+        # the external actor removes the bad bytes; the same open instance
+        # revalidates and can write again with a continuous seq chain
+        self.path.write_bytes(good_prefix)
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    # ----- category 2: legal external records keep existing semantics --------
+
+    def test_external_pending_records_are_kept_and_join_the_new_batch(self):
+        s = self.base_store()
+        good_prefix = self.path.read_bytes()
+        # a full legal, terminated but uncommitted batch written out of band
+        ext_set = self.record(
+            {"op": "set", "key": "ext", "value": 7, "seq": 2}
+        )
+        ext_del = self.record({"op": "delete", "key": "a", "seq": 2})
+        self.append_bytes(ext_set + ext_del)
+
+        # the new record continues from the file's last COMMITTED seq (1)+1;
+        # it joins the external batch at seq 2 rather than clobbering it
+        s.set("b", 2)
+        new_row = self.record({"op": "set", "key": "b", "value": 2, "seq": 2})
+        # external complete records are preserved byte for byte; the local
+        # record is simply appended after them, nothing truncated
+        self.assertEqual(self.path.read_bytes(),
+                         good_prefix + ext_set + ext_del + new_row)
+        self.assertEqual(
+            s.pending_changes().changes,
+            [
+                {"op": "set", "key": "ext", "value": 7},
+                {"op": "delete", "key": "a"},
+                {"op": "set", "key": "b", "value": 2},
+            ],
+        )
+        # committing seals the whole batch (external + local) at seq 2
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(s.state, {"b": 2, "ext": 7})
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"b": 2, "ext": 7}, 2))
+
+    def test_external_committed_batch_is_observed_and_next_seq_follows(self):
+        s = self.base_store()
+        good_prefix = self.path.read_bytes()
+        # an entire committed batch lands out of band while s is open
+        self.append_bytes(
+            self.record({"op": "set", "key": "ext", "value": 7, "seq": 2})
+            + self.record({"op": "commit", "seq": 2})
+        )
+        # s still caches seq 1; the append replays and follows seq 3, never
+        # reusing seq 2 and overwriting the unknown committed data
+        s.set("n", 5)
+        last = json.loads(self.path.read_bytes().splitlines()[-1])
+        self.assertEqual(last, {"op": "set", "key": "n", "value": 5, "seq": 3})
+        # the re-determined committed view and seq converge with the file
+        self.assertEqual(s.state, {"a": 1, "ext": 7})
+        self.assertEqual(s.commit_seq, 2)
+        self.assertEqual(s.pending_changes().commit_seq, 2)
+        self.assertEqual(s.commit(), 3)
+        self.assertEqual(s.state, {"a": 1, "ext": 7, "n": 5})
+        s2 = WalStore(self.path)
+        self.assertEqual(
+            (s2.state, s2.commit_seq),
+            ({"a": 1, "ext": 7, "n": 5}, 3),
+        )
+        # original prefix bytes were never rewritten
+        self.assertTrue(self.path.read_bytes().startswith(good_prefix))
+
+    # ----- category 3: a recognisable tail fragment is the one truncation -----
+
+    def test_external_tail_fragment_is_removed_then_append_continues(self):
+        base = self.base_store()
+        good_prefix = self.path.read_bytes()
+        base.close()
+        fragments = [
+            '{"op": "set", "key": "x"',
+            "{",
+            '{"op": "commit", "seq": 2',
+            '{"op": "set", "key": "hé'.encode("utf-8")[:-1],  # truncated UTF-8
+            json.dumps({"op": "set", "key": "x", "value": 9, "seq": 2}),
+        ]
+        new_row = self.record({"op": "set", "key": "b", "value": 2, "seq": 2})
+        for frag in fragments:
+            raw = frag if isinstance(frag, bytes) else frag.encode("utf-8")
+            self.path.write_bytes(good_prefix + raw)
+            s = WalStore(self.path)  # open instance, then fragment appears
+            s.set("b", 2)
+            # only the fragment is gone; the new seq-2 record follows the
+            # intact committed prefix byte for byte
+            self.assertEqual(self.path.read_bytes(), good_prefix + new_row,
+                             msg=frag)
+            self.assertNotIn(b'"x"', self.path.read_bytes(), msg=frag)
+            self.assertEqual(s.commit(), 2)
+            s2 = WalStore(self.path)
+            self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2),
+                             msg=frag)
+
+    def test_fragment_removal_keeps_complete_pending_records(self):
+        s = self.base_store()
+        good_prefix = self.path.read_bytes()
+        pending = self.record({"op": "set", "key": "p", "value": 4, "seq": 2})
+        self.append_bytes(pending + b'{"op": "set", "key": "x"')
+        # delete goes through the same revalidation/truncation path
+        s.delete("a")
+        data = self.path.read_bytes()
+        new_row = self.record({"op": "delete", "key": "a", "seq": 2})
+        # the legal terminated pending record survives; only the fragment is
+        # removed, and the local record is appended to the intact prefix
+        self.assertEqual(data, good_prefix + pending + new_row)
+        self.assertNotIn(b'"x"', data)
+        self.assertEqual(s.pending_changes().pending_count, 2)
+        self.assertEqual(s.commit(), 2)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"p": 4}, 2))
+
+    # ----- per-op success: file bytes, seq, recovery --------------------------
+
+    def test_set_success_appends_durable_seq_record(self):
+        s = self.base_store()
+        before = self.path.stat().st_size
+        s.set("b", 2)
+        row = self.record({"op": "set", "key": "b", "value": 2, "seq": 2})
+        self.assertEqual(self.path.read_bytes()[before:], row)
+        # state stays deferred until commit; seq of the open batch is 2
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(WalStore(self.path).pending_changes().changes,
+                         [{"op": "set", "key": "b", "value": 2}])
+
+    def test_delete_success_appends_durable_seq_record(self):
+        s = self.base_store()
+        before = self.path.stat().st_size
+        s.delete("a")
+        row = self.record({"op": "delete", "key": "a", "seq": 2})
+        self.assertEqual(self.path.read_bytes()[before:], row)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(WalStore(self.path).state, {})
+
+    def test_commit_success_advances_seq_only_after_persist(self):
+        s = self.base_store()
+        before = self.path.stat().st_size
+        self.assertEqual(s.commit(), 2)  # empty commit
+        row = self.record({"op": "commit", "seq": 2})
+        self.assertEqual(self.path.read_bytes()[before:], row)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 2))
+        self.assertEqual(WalStore(self.path).commit_seq, 2)
+
+    # ----- per-op sync failure: OSError, no adopted state/seq ----------------
+
+    def test_set_sync_failure_propagates_and_adopts_nothing(self):
+        s = self.base_store()
+        size = self.path.stat().st_size
+        with mock.patch("app.os.fsync", side_effect=OSError("disk on fire")):
+            with self.assertRaises(OSError):
+                s.set("b", 2)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # the un-durable record was best-effort rolled back; reopen confirms
+        self.assertEqual(self.path.stat().st_size, size)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s2.recover()["pending_count"], 0)
+        # no seq was consumed: retry seals exactly seq 2
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+
+    def test_delete_sync_failure_propagates_and_adopts_nothing(self):
+        s = self.base_store()
+        size = self.path.stat().st_size
+        with mock.patch("app.os.fsync", side_effect=OSError("disk on fire")):
+            with self.assertRaises(OSError):
+                s.delete("a")
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual(WalStore(self.path).recover()["pending_count"], 0)
+        s.delete("a")
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(WalStore(self.path).state, {})
+
+    def test_commit_sync_failure_propagates_and_keeps_old_commit(self):
+        s = self.base_store()
+        s.set("c", 3)  # durable pending record, seq 2
+        size = self.path.stat().st_size
+        with mock.patch("app.os.fsync", side_effect=OSError("disk on fire")):
+            with self.assertRaises(OSError):
+                s.commit()
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        # the failed commit boundary is gone; the pending set remains visible
+        self.assertEqual(self.path.stat().st_size, size)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s2.pending_changes().changes,
+                         [{"op": "set", "key": "c", "value": 3}])
+        # retry commits exactly seq 2
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(s.state, {"a": 1, "c": 3})
+
+    def test_sync_failure_with_external_pending_loses_only_local_bytes(self):
+        s = self.base_store()
+        self.append_bytes(
+            self.record({"op": "set", "key": "ext", "value": 7, "seq": 2})
+        )
+        ext_size = self.path.stat().st_size
+        with mock.patch("app.os.fsync", side_effect=OSError("disk on fire")):
+            with self.assertRaises(OSError):
+                s.set("b", 2)
+        # external pending bytes survive; only the local record is rolled back
+        self.assertEqual(self.path.stat().st_size, ext_size)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.pending_changes().changes,
+                         [{"op": "set", "key": "ext", "value": 7}])
+        # retry joins the surviving external batch and seals at seq 2
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(s.state, {"a": 1, "b": 2, "ext": 7})
+
+    # ----- lease / mode exception priority is unchanged ----------------------
+
+    def test_readonly_and_closed_priority_beat_revalidation(self):
+        s = self.base_store()
+        ro = WalStore(self.path, readonly=True)
+        s_close = self.base_store()
+        self.append_bytes(b'{"op": "set", "key": "x"}\n')  # corrupt out of band
+        # read-only refusal happens before the log is replayed
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.set("b", 2)
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.delete("a")
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.commit()
+        # closed refusal takes priority as well
+        s_close.close()
+        with self.assertRaises(app.WalClosedError):
+            s_close.set("b", 2)
+        with self.assertRaises(app.WalClosedError):
+            s_close.commit()
+        # the live writable instance still detects the corruption properly
+        with self.assertRaises(WalCorruptionError):
+            s.set("b", 2)
+
+    def test_exclusive_holder_revalidates_external_changes(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        self.append_bytes(
+            self.record({"op": "set", "key": "ext", "value": 7, "seq": 2})
+            + b'{"op": "set", "key": "frag"'
+        )
+        # external pending kept, fragment dropped, write continues at seq 2
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq),
+                         ({"a": 1, "b": 2, "ext": 7}, 2))
+        s.close()
 
 
 if __name__ == "__main__":

@@ -545,24 +545,6 @@ class WalStore:
         if self._readonly:
             raise WalReadOnlyError("WalStore was opened read-only")
 
-    def _drop_tail_fragment(self):
-        """Remove a discarded tail fragment left by an interrupted write.
-
-        Only bytes beyond the last complete record (as judged by the latest
-        replay) are removed, so a later append can never re-consume the
-        fragment as part of a new record; the durable prefix is never
-        rewritten.
-        """
-        if self._valid_size is None or not self.path.exists():
-            return
-        if self.path.stat().st_size <= self._valid_size:
-            return
-        with self.path.open("r+b") as f:
-            self._authorize_write_handle(f)
-            f.truncate(self._valid_size)
-            f.flush()
-            os.fsync(f.fileno())
-
     def _authorize_write_handle(self, f):
         """Pin every write-mode WAL handle to the leased real object.
 
@@ -578,16 +560,78 @@ class WalStore:
         else:
             self._verify_leased_object(f)
 
+    def _revalidate_for_append(self):
+        """Validate the whole log by the exact recover rules before appending.
+
+        A store can stay open while its log is appended to or damaged out of
+        band, so the boundaries cached when the store opened are never trusted
+        for a write: the log is replayed from the head exactly as recover()
+        does, re-determining valid_bytes, committed_bytes, and the last
+        committed state. The replay builds only local objects, so a terminated
+        invalid record, a blank/whitespace record, illegal UTF-8, duplicate or
+        missing fields, an unknown op, a bad key/value, or a seq break raises
+        WalCorruptionError without appending, truncating, or adopting anything
+        -- state, commit_seq, and the byte boundary a later rollback observes
+        are all left untouched.
+
+        The only bytes allowed beyond the replayed valid_bytes are the single
+        trailing interrupted-write fragment the recovery rules recognise; that
+        fragment is removed in place exactly as before, while every complete
+        record before it -- legal uncommitted set/delete records included -- is
+        preserved byte for byte. Returns the replayed committed view and the
+        last committed seq in the file; the next record must use
+        ``committed + 1`` rather than any seq cached at open time.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        saved_boundary = self._valid_size
+        try:
+            (
+                candidate,
+                committed,
+                _pending_count,
+                valid_size,
+                _committed_size,
+            ) = self._replay()
+            file_size = self.path.stat().st_size if self.path.exists() else 0
+            if file_size > valid_size:
+                # The replay has already proved the bytes beyond valid_size
+                # are exactly one unfinished tail fragment -- anything else
+                # raised WalCorruptionError above -- so removing them can
+                # never discard a complete, terminated record.
+                with self.path.open("r+b") as f:
+                    self._authorize_write_handle(f)
+                    f.truncate(valid_size)
+                    f.flush()
+                    os.fsync(f.fileno())
+        except BaseException:
+            # Neither a failed validation nor a failed fragment removal
+            # adopts a boundary: state, commit_seq, and the cached
+            # accepted-prefix edge stay exactly as on entry. Every later
+            # write revalidates from the head in any case.
+            self._valid_size = saved_boundary
+            raise
+        return candidate, committed
+
     def _append(self, row):
-        """Durably append one log record.
+        """Durably append one log record after head-to-tail revalidation.
+
+        The whole log is validated under the exact recover rules first (see
+        _revalidate_for_append); WalCorruptionError propagates with the file
+        and in-memory state untouched. The record's seq is stamped from the
+        seq replayed out of the file -- the file's last committed seq plus
+        one -- never from a value cached when the store opened, so a batch
+        committed out of band while the store was open extends the chain
+        instead of being overwritten.
 
         Raises OSError if the record cannot be written or synced; the
         un-durable tail is best-effort truncated back so a failed write can
-        never masquerade as a committed record on reopen.
+        never masquerade as a committed record on reopen, and no new state is
+        adopted before the record is durable.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(row, sort_keys=True) + "\n"
-        self._drop_tail_fragment()
+        candidate, committed = self._revalidate_for_append()
+        record = dict(row)
+        record["seq"] = committed + 1
+        line = json.dumps(record, sort_keys=True) + "\n"
         created = not self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
             self._authorize_write_handle(f)
@@ -604,9 +648,15 @@ class WalStore:
                 except OSError:
                     pass
                 raise
-            # The appended record is complete and durable, so the durable
-            # prefix now extends to the new end of the file.
-            self._valid_size = f.tell()
+            new_size = f.tell()
+        # Adopt only once the appended record is complete and durable.
+        # candidate is the last *committed* view -- pending records never
+        # join it -- so a set/delete append keeps the state deferred until
+        # commit exactly as before, while a batch committed out of band
+        # converges memory with what a reopen would recover.
+        self._valid_size = new_size
+        self.state = candidate
+        self.commit_seq = committed
         if created:
             self._fsync_parent_dir()
 
@@ -631,22 +681,22 @@ class WalStore:
         self._check_writable()
         _validate_key(key)
         _validate_value(value)
-        self._append(
-            {"op": "set", "key": key, "value": value, "seq": self.commit_seq + 1}
-        )
+        # The seq is stamped inside _append from a fresh head-to-tail replay,
+        # not from the open-time cached commit_seq.
+        self._append({"op": "set", "key": key, "value": value})
 
     def delete(self, key):
         self._check_writable()
         _validate_key(key)
-        self._append({"op": "delete", "key": key, "seq": self.commit_seq + 1})
+        self._append({"op": "delete", "key": key})
 
     def commit(self):
-        # Persist the commit boundary first and only adopt the new seq/state
-        # once it is durable: a failed write must neither consume the seq nor
-        # present a committed state.
+        # Re-validate the whole log and persist the commit boundary first; the
+        # seq is stamped from the replayed last commit, and the new seq/state
+        # are adopted only once the record is durable: a failed validation or
+        # write must neither consume a seq nor present a committed state.
         self._check_writable()
-        seq = self.commit_seq + 1
-        self._append({"op": "commit", "seq": seq})
+        self._append({"op": "commit"})
         self.recover()
         return self.commit_seq
 
