@@ -13,6 +13,19 @@ class WalCorruptionError(ValueError):
     """Raised when the write-ahead log fails validation."""
 
 
+class WalIntegrityError(Exception):
+    """Raised when integrity mode is requested for an unprotected log.
+
+    integrity=True refuses to adopt a non-empty log whose records carry no
+    integrity metadata at all: silently starting a protected chain after a
+    legacy history would make that history indistinguishable from a
+    truncated protected one. The log is neither created, truncated, nor
+    appended to, and no in-memory state changes; the caller must either
+    open the log in the default mode (which keeps the legacy format) or
+    start a fresh protected log at another path.
+    """
+
+
 class WalBusyError(Exception):
     """Raised when an exclusive write lease is already held for the log path."""
 
@@ -81,6 +94,30 @@ _LITERAL_PREFIXES = ("true", "false", "null")
 # Remainders after an already-parsed integer part that can still grow into a
 # valid JSON number when more bytes arrive (e.g. "1." -> "1.5", "1e" -> "1e5").
 _NUMBER_TAILS = frozenset({".", "e", "E", "e+", "e-", "E+", "E-"})
+
+# Field name carrying a protected record's integrity metadata. Legacy
+# records never contain it; a protected log carries it on every record.
+_INTEGRITY_FIELD = "ic"
+
+# Domain-separated seed of the integrity hash chain: the prev-chain value
+# assumed for the first record of a protected log.
+_CHAIN_SEED = hashlib.sha256(b"walstore-integrity-chain-v1").hexdigest()
+
+
+def _chain_digest(prev_chain, core_line):
+    """Integrity metadata of one protected record.
+
+    Chains the record's canonical core line (every field except the
+    integrity metadata itself, JSON-serialised with sorted keys) onto the
+    previous record's digest, so the digest covers the record's content,
+    its commit seq, and its position in the operation order: rewriting
+    content, deleting or inserting a record, or reordering records breaks
+    the chain at the first touched boundary and is detected when the log
+    is verified.
+    """
+    return hashlib.sha256(
+        (prev_chain + "\n" + core_line).encode("utf-8")
+    ).hexdigest()
 
 
 def _is_incomplete_record(exc, line):
@@ -219,7 +256,7 @@ _LOCK_DIR = os.path.join(tempfile.gettempdir(), "walstore_locks")
 
 
 class WalStore:
-    def __init__(self, path, exclusive=False, readonly=False):
+    def __init__(self, path, exclusive=False, readonly=False, integrity=False):
         # Validate every parameter before touching the path in any way: a
         # rejected call must never read, create, truncate, or append to the
         # log or its lock file.
@@ -236,6 +273,10 @@ class WalStore:
                 "exclusive and readonly cannot both be True: a read-only "
                 "store never takes the write lease"
             )
+        if not isinstance(integrity, bool):
+            raise ValueError(
+                "integrity must be a bool, got %r" % (type(integrity).__name__,)
+            )
         self.path = Path(path)
         self.state = {}
         self.commit_seq = 0
@@ -244,6 +285,16 @@ class WalStore:
         self._valid_size = None
         self._closed = False
         self._readonly = readonly
+        # Integrity protection mode. _integrity_requested records the
+        # constructor's integrity flag; _protected is the effective mode --
+        # True when integrity was requested or the log was recognised as
+        # protected on replay, so a protected log opened in the default
+        # mode keeps its protected format. _chain_head is the integrity
+        # chain digest just past the accepted prefix (the seed for an
+        # empty or missing log); the next protected record chains onto it.
+        self._integrity_requested = integrity
+        self._protected = integrity
+        self._chain_head = _CHAIN_SEED
         # Legacy per-normalized-path lease descriptor (kept for the exact
         # historical sibling-lock behaviour) plus the real-object identity
         # lease descriptors:
@@ -264,7 +315,14 @@ class WalStore:
             # appending to the log. A read-only instance never takes it and
             # may open a path leased by a live exclusive writer.
             self._acquire_lease()
-        self.recover()
+        try:
+            self.recover()
+        except BaseException:
+            # A failed open (corruption, or WalIntegrityError when
+            # integrity=True meets a fully unprotected legacy log) must not
+            # leak the lease: the instance is never handed to the caller.
+            self._release_lease_fds()
+            raise
 
     @staticmethod
     def _busy_error(path):
@@ -584,6 +642,7 @@ class WalStore:
         """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         saved_boundary = self._valid_size
+        saved_chain_head = self._chain_head
         try:
             (
                 candidate,
@@ -605,10 +664,12 @@ class WalStore:
                     os.fsync(f.fileno())
         except BaseException:
             # Neither a failed validation nor a failed fragment removal
-            # adopts a boundary: state, commit_seq, and the cached
-            # accepted-prefix edge stay exactly as on entry. Every later
-            # write revalidates from the head in any case.
+            # adopts a boundary: state, commit_seq, the cached
+            # accepted-prefix edge, and the cached integrity chain head
+            # stay exactly as on entry. Every later write revalidates from
+            # the head in any case.
             self._valid_size = saved_boundary
+            self._chain_head = saved_chain_head
             raise
         return candidate, committed
 
@@ -631,6 +692,14 @@ class WalStore:
         candidate, committed = self._revalidate_for_append()
         record = dict(row)
         record["seq"] = committed + 1
+        if self._protected:
+            # Chain the record onto the integrity digest replayed out of
+            # the accepted prefix (the seed for an empty log), exactly as
+            # the replay recomputes it: the canonical core line is the
+            # record without its integrity metadata, JSON-serialised with
+            # sorted keys.
+            core_line = json.dumps(record, sort_keys=True)
+            record[_INTEGRITY_FIELD] = _chain_digest(self._chain_head, core_line)
         line = json.dumps(record, sort_keys=True) + "\n"
         created = not self.path.exists()
         with self.path.open("a", encoding="utf-8") as f:
@@ -1495,6 +1564,12 @@ class WalStore:
         # Byte offset just past the last durable commit record (0 when there
         # is no committed prefix); rollback truncates at exactly this point.
         committed_size = 0
+        # Integrity chain state for protected logs: log_protected is decided
+        # by the first parsed record (None until then) and must agree with
+        # every later record -- protected and unprotected records may never
+        # mix. chain is the running digest the next record must chain onto.
+        log_protected = None
+        chain = _CHAIN_SEED
         if self.path.exists():
             data = self.path.read_bytes()
             try:
@@ -1559,7 +1634,21 @@ class WalStore:
                 schema = _SCHEMAS.get(op)
                 if schema is None:
                     raise WalCorruptionError("unknown op: %r" % (op,))
-                if set(row) != schema:
+                # The first parsed record decides the log's format; every
+                # later record must carry the same protection. Mixing
+                # protected and unprotected records is corruption, never a
+                # format upgrade.
+                has_integrity = _INTEGRITY_FIELD in row
+                if log_protected is None:
+                    log_protected = has_integrity
+                elif has_integrity != log_protected:
+                    raise WalCorruptionError(
+                        "protected and unprotected records are mixed in the log"
+                    )
+                expected_fields = (
+                    schema | {_INTEGRITY_FIELD} if log_protected else schema
+                )
+                if set(row) != expected_fields:
                     raise WalCorruptionError(
                         "bad fields for op %r: %r" % (op, sorted(row))
                     )
@@ -1583,6 +1672,24 @@ class WalStore:
                         raise
                     except ValueError as exc:
                         raise WalCorruptionError(str(exc)) from exc
+                if log_protected:
+                    # Verify the record's integrity metadata before it can be
+                    # accepted -- or even recognised as a discardable
+                    # unfinished fragment: an integrity mismatch is always
+                    # corruption, never a repairable tail. The digest chains
+                    # the canonical core line (the record without its
+                    # metadata) onto the previous record's digest, covering
+                    # content, commit seq, and operation order.
+                    core_line = json.dumps(
+                        {k: v for k, v in row.items() if k != _INTEGRITY_FIELD},
+                        sort_keys=True,
+                    )
+                    expected_ic = _chain_digest(chain, core_line)
+                    if row[_INTEGRITY_FIELD] != expected_ic:
+                        raise WalCorruptionError(
+                            "integrity metadata mismatch for seq %r" % (seq,)
+                        )
+                    chain = expected_ic
                 if not terminated:
                     # The record's terminator never became durable, so the
                     # write is unfinished: the fragment is discarded whole --
@@ -1645,6 +1752,26 @@ class WalStore:
                             "value": copy.deepcopy(p["value"]),
                         }
                     )
+        # Adopt the format the log itself proved to have. A protected log
+        # stays protected even when opened in the default mode; a log with
+        # no parsed records at all (missing, empty, or only an
+        # unrecognisable interrupted-write prefix) keeps the mode the store
+        # already had, so an integrity=True store starts a protected chain
+        # on an empty log. A non-empty log that is fully unprotected is a
+        # legacy log: the default mode keeps reading and extending it in
+        # the legacy format, but integrity=True refuses it with the unique
+        # WalIntegrityError -- before any state, boundary, or chain head is
+        # adopted.
+        if log_protected is True:
+            self._protected = True
+        elif log_protected is False:
+            if self._integrity_requested:
+                raise WalIntegrityError(
+                    "log is not empty and carries no integrity protection: %r"
+                    % (str(self.path),)
+                )
+            self._protected = False
+        self._chain_head = chain
         self._valid_size = valid_size
         return candidate, committed, len(pending), valid_size, committed_size
 

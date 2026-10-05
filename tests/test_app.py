@@ -4919,5 +4919,372 @@ class PreAppendRevalidationTest(unittest.TestCase):
         s.close()
 
 
+class IntegrityTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def read_rows(self):
+        return [
+            json.loads(line)
+            for line in self.path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def write_rows(self, rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, sort_keys=True))
+                f.write("\n")
+
+    def protected_store(self):
+        """A committed protected log: {a: 1, b: 2} at seq 2."""
+        s = WalStore(self.path, integrity=True)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        s.commit()
+        return s
+
+    # ----- parameter validation ---------------------------------------------
+
+    def test_integrity_param_must_be_bool(self):
+        for bad in (1, 0, "yes", None, 1.0):
+            with self.assertRaises(ValueError):
+                WalStore(self.path, integrity=bad)
+        self.assertFalse(self.path.exists())
+
+    # ----- chain start and format preservation -------------------------------
+
+    def test_empty_log_starts_protected_chain(self):
+        s = WalStore(self.path, integrity=True)
+        s.set("a", 1)
+        self.assertEqual(s.commit(), 1)
+        rows = self.read_rows()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertIn("ic", row)
+            self.assertIsInstance(row["ic"], str)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+    def test_empty_existing_file_starts_protected_chain(self):
+        self.path.write_text("")
+        s = WalStore(self.path, integrity=True)
+        s.set("a", 1)
+        s.commit()
+        self.assertIn("ic", self.read_rows()[0])
+
+    def test_protected_log_stays_protected_in_default_mode(self):
+        self.protected_store().close()
+        s = WalStore(self.path)  # default mode
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        s.set("c", 3)
+        self.assertEqual(s.commit(), 3)
+        rows = self.read_rows()
+        self.assertTrue(all("ic" in row for row in rows))
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2, "c": 3}, 3))
+
+    def test_integrity_reopen_of_protected_log(self):
+        self.protected_store().close()
+        for _ in range(2):
+            s = WalStore(self.path, integrity=True)
+            self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+            r = s.recover()
+            self.assertEqual(r["state"], {"a": 1, "b": 2})
+            self.assertEqual(r["commit_seq"], 2)
+            s.close()
+
+    # ----- WalIntegrityError on fully unprotected legacy logs ----------------
+
+    def test_integrity_rejects_fully_unprotected_log(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        before = self.path.read_bytes()
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True)
+        # nothing created, truncated, appended, or adopted
+        self.assertEqual(self.path.read_bytes(), before)
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True, readonly=True)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_integrity_error_is_unique_and_not_corruption(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        try:
+            WalStore(self.path, integrity=True)
+            self.fail("expected WalIntegrityError")
+        except app.WalIntegrityError as exc:
+            self.assertNotIsInstance(exc, WalCorruptionError)
+
+    def test_default_mode_keeps_legacy_log_legacy(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)
+        s.commit()
+        rows = self.read_rows()
+        self.assertTrue(all("ic" not in row for row in rows))
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    def test_failed_integrity_open_releases_lease(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, exclusive=True, integrity=True)
+        # the failed open must not leave the lease held
+        s2 = WalStore(self.path, exclusive=True)
+        s2.close()
+
+    # ----- tamper detection ---------------------------------------------------
+
+    def test_content_rewrite_detected(self):
+        self.protected_store().close()
+        rows = self.read_rows()
+        rows[0]["value"] = 999  # rewrite a committed value in place
+        self.write_rows(rows)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, integrity=True)
+
+    def test_record_deletion_detected(self):
+        self.protected_store().close()
+        rows = self.read_rows()
+        del rows[1]  # delete the commit record of seq 1
+        self.write_rows(rows)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_record_insertion_detected(self):
+        self.protected_store().close()
+        rows = self.read_rows()
+        rows.insert(1, dict(rows[1]))  # splice in a duplicate record
+        self.write_rows(rows)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_record_reorder_detected(self):
+        self.protected_store().close()
+        rows = self.read_rows()
+        rows[0], rows[1] = rows[1], rows[0]
+        self.write_rows(rows)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_missing_integrity_metadata_detected(self):
+        self.protected_store().close()
+        rows = self.read_rows()
+        del rows[1]["ic"]  # strip protection from one record
+        self.write_rows(rows)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_mixed_protection_rejected_both_ways(self):
+        # unprotected history followed by a protected record
+        legacy = WalStore(self.path)
+        legacy.set("a", 1)
+        legacy.commit()
+        legacy.close()
+        other = Path(self.dir.name) / "other.wal"
+        s = WalStore(other, integrity=True)
+        s.set("b", 2)
+        s.commit()
+        s.close()
+        protected_rows = [
+            json.loads(line)
+            for line in other.read_text(encoding="utf-8").splitlines()
+        ]
+        protected_line = other.read_text(encoding="utf-8").splitlines()[0]
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(protected_line + "\n")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, integrity=True)
+        # protected history followed by an unprotected record
+        self.write_rows(protected_rows[:1])
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "commit", "seq": 1}) + "\n")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    # ----- every entry verifies the whole log --------------------------------
+
+    def test_all_queries_verify_full_log(self):
+        s = self.protected_store()
+        rows = self.read_rows()
+        rows[2]["value"] = 999  # corrupt a committed record out of band
+        self.write_rows(rows)
+        for call in (
+            s.recover,
+            s.audit,
+            s.pending_changes,
+            s.snapshot,
+            s.history,
+            lambda: s.diff(0, 1),
+            s.scan,
+            lambda: s.get("a"),
+            lambda: s.contains("a"),
+            lambda: s.set("c", 3),
+            lambda: s.delete("a"),
+            s.commit,
+            s.rollback,
+            s.repair_tail,
+            lambda: s.restore(1),
+            lambda: s.apply_batch(2, []),
+        ):
+            with self.assertRaises(WalCorruptionError):
+                call()
+        # no partial adoption: in-memory state and file are untouched
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        self.assertEqual(self.read_rows(), rows)
+
+    def test_write_entries_verify_before_appending(self):
+        s = self.protected_store()
+        rows = self.read_rows()
+        rows[0]["key"] = "tampered"
+        self.write_rows(rows)
+        size = self.path.stat().st_size
+        with self.assertRaises(WalCorruptionError):
+            s.set("c", 3)
+        # nothing appended and no seq consumed
+        self.assertEqual(self.path.stat().st_size, size)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    # ----- crash recovery, pending, rollback ----------------------------------
+
+    def test_uncommitted_protected_records_pending_then_recovered(self):
+        s = WalStore(self.path, integrity=True)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # process "dies" before commit
+        s.close()
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        pc = s2.pending_changes()
+        self.assertEqual(pc["commit_seq"], 1)
+        self.assertEqual(pc["pending_count"], 1)
+        # pending changes expose no integrity metadata
+        self.assertEqual(pc["changes"], [{"op": "set", "key": "b", "value": 2}])
+        # rollback clears them; retry continues the chain without gaps
+        self.assertEqual(s2.rollback(), 1)
+        s2.set("b", 2)
+        self.assertEqual(s2.commit(), 2)
+        s3 = WalStore(self.path, integrity=True)
+        self.assertEqual((s3.state, s3.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    def test_repair_tail_clears_valid_protected_fragment(self):
+        s = self.protected_store()
+        rows = self.read_rows()
+        chain = app._CHAIN_SEED
+        for row in rows:
+            core = json.dumps(
+                {k: v for k, v in row.items() if k != "ic"}, sort_keys=True
+            )
+            chain = app._chain_digest(chain, core)
+        nxt = {"op": "set", "key": "c", "value": 3, "seq": 3}
+        nxt["ic"] = app._chain_digest(chain, json.dumps(nxt, sort_keys=True))
+        # the record's terminator never became durable: interrupted write
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(nxt, sort_keys=True))
+        res = s.repair_tail()
+        self.assertEqual(res["removed_bytes"], len(json.dumps(nxt, sort_keys=True)))
+        self.assertEqual(res["state"], {"a": 1, "b": 2})
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    def test_repair_tail_never_repairs_integrity_mismatch(self):
+        s = self.protected_store()
+        before = self.path.read_bytes()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"op": "set", "key": "c", "value": 3,
+                                "seq": 3, "ic": "0" * 64}, sort_keys=True))
+        with self.assertRaises(WalCorruptionError):
+            s.repair_tail()
+        # the file, state, and seq are untouched
+        self.assertEqual(
+            self.path.read_bytes(),
+            before + json.dumps({"op": "set", "key": "c", "value": 3,
+                                 "seq": 3, "ic": "0" * 64},
+                                sort_keys=True).encode(),
+        )
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+
+    # ----- history/snapshot/diff consistency ----------------------------------
+
+    def test_history_snapshot_diff_consistent_across_reopen(self):
+        s = WalStore(self.path, integrity=True)
+        s.set("a", {"n": [1, True]})
+        s.commit()
+        s.delete("a")
+        s.set("b", 2)
+        s.commit()
+        h1, d1 = s.history(), s.diff(1, 2)
+        snap1 = s.snapshot(1)
+        s.close()
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual(s2.history(), h1)
+        self.assertEqual(s2.diff(1, 2), d1)
+        self.assertEqual(s2.snapshot(1), snap1)
+        self.assertEqual(s2.snapshot(1)["state"], {"a": {"n": [1, True]}})
+        # mutating returned values never affects the store
+        snap1["state"]["a"]["n"].append(9)
+        h1[0]["changes"][0]["value"]["n"].append(9)
+        self.assertEqual(s2.snapshot(1)["state"], {"a": {"n": [1, True]}})
+        self.assertEqual(s2.history()[0]["changes"][0]["value"],
+                         {"n": [1, True]})
+
+    def test_restore_and_apply_batch_on_protected_log(self):
+        s = self.protected_store()
+        self.assertEqual(s.restore(1), 3)
+        self.assertEqual(s.state, {"a": 1})
+        self.assertEqual(s.apply_batch(3, [{"op": "set", "key": "z",
+                                            "value": [1, {"x": True}]}]), 4)
+        rows = self.read_rows()
+        self.assertTrue(all("ic" in row for row in rows))
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual(s2.state, {"a": 1, "z": [1, {"x": True}]})
+        self.assertEqual(s2.commit_seq, 4)
+
+    # ----- modes ---------------------------------------------------------------
+
+    def test_readonly_integrity_verifies_and_queries(self):
+        self.protected_store().close()
+        ro = WalStore(self.path, readonly=True, integrity=True)
+        self.assertEqual(ro.audit()["commit_seq"], 2)
+        self.assertEqual(ro.snapshot()["state"], {"a": 1, "b": 2})
+        self.assertEqual(len(ro.history()), 2)
+        self.assertEqual(ro.scan(), [{"key": "a", "value": 1},
+                                     {"key": "b", "value": 2}])
+        for call in (lambda: ro.set("c", 3), ro.commit, ro.rollback,
+                     ro.repair_tail, lambda: ro.restore(1),
+                     lambda: ro.apply_batch(2, [])):
+            with self.assertRaises(app.WalReadOnlyError):
+                call()
+
+    def test_exclusive_integrity_lease(self):
+        s = WalStore(self.path, exclusive=True, integrity=True)
+        s.set("a", 1)
+        s.commit()
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True, integrity=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        s.close()
+        s2 = WalStore(self.path, exclusive=True, integrity=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        s2.close()
+
+
 if __name__ == "__main__":
     unittest.main()
