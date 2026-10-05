@@ -4281,5 +4281,334 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(reopened.scan(), s.scan())
 
 
+class DiffTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_bytes(self):
+        return self.path.read_bytes() if self.path.exists() else None
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1, True]})
+        s.set("c", "x")
+        s.commit()  # seq 1
+        s.set("b", {"n": [1, True, 2]})
+        s.delete("c")
+        s.set("d", None)
+        s.commit()  # seq 2
+        s.set("a", 1)  # same value as seq 1/2: no diff entry
+        s.commit()  # seq 3
+        return s
+
+    def test_empty_log_only_allows_zero_zero(self):
+        s = WalStore(self.path)  # path does not exist
+        r = s.diff(0, 0)
+        self.assertEqual(r, {"from_seq": 0, "to_seq": 0, "changes": []})
+        self.assertEqual(r.from_seq, 0)
+        self.assertEqual(r.to_seq, 0)
+        self.assertEqual(r.changes, [])
+        self.assertFalse(self.path.exists())  # never creates the file
+        self.path.write_bytes(b"")
+        self.assertEqual(s.diff(0, 0)["changes"], [])
+        for bad in (1, 2):
+            with self.assertRaises(ValueError):
+                s.diff(0, bad)
+            with self.assertRaises(ValueError):
+                s.diff(bad, bad)
+
+    def test_diff_between_two_commits(self):
+        s = self.build()
+        r = s.diff(1, 2)
+        self.assertEqual(r.from_seq, 1)
+        self.assertEqual(r.to_seq, 2)
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "b", "value": {"n": [1, True, 2]}},
+                {"op": "delete", "key": "c"},
+                {"op": "set", "key": "d", "value": None},
+            ],
+        )
+        # exact fields per entry; seq is never exposed
+        for change in r.changes:
+            self.assertIn(set(change), ({"op", "key", "value"}, {"op", "key"}))
+
+    def test_changes_sorted_by_unicode_code_point(self):
+        s = WalStore(self.path)
+        s.commit()  # seq 1: empty
+        s.set("中", 1)
+        s.set("B", 2)
+        s.set("é", 3)
+        s.set("aa", 4)
+        s.set("a", 5)
+        s.commit()  # seq 2
+        r = s.diff(1, 2)
+        keys = [c["key"] for c in r.changes]
+        self.assertEqual(keys, ["B", "a", "aa", "é", "中"])
+        self.assertEqual(keys, sorted(keys))
+
+    def test_zero_seq_denotes_empty_object(self):
+        s = self.build()
+        r = s.diff(0, 1)
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "a", "value": 1},
+                {"op": "set", "key": "b", "value": {"n": [1, True]}},
+                {"op": "set", "key": "c", "value": "x"},
+            ],
+        )
+        # an inverted range is rejected, even towards the empty object
+        with self.assertRaises(ValueError):
+            s.diff(1, 0)
+        self.assertEqual(s.diff(0, 0).changes, [])
+
+    def test_identical_states_return_empty_changes(self):
+        s = self.build()
+        for seq in (0, 1, 2, 3):
+            self.assertEqual(s.diff(seq, seq).changes, [])
+        # seq 3 only re-set "a" to the same value: no key-level change
+        self.assertEqual(s.diff(2, 3).changes, [])
+        self.assertEqual(s.diff(1, 3).changes, s.diff(1, 2).changes)
+
+    def test_json_type_distinction_forces_set(self):
+        s = WalStore(self.path)
+        s.set("i", 1)
+        s.set("f", 1.0)
+        s.set("nested", {"flag": True, "items": [1, None]})
+        s.commit()  # seq 1
+        s.set("i", True)  # 1 -> true: different JSON types
+        s.set("f", 1)  # 1.0 -> 1: same JSON number family, no change
+        s.set("nested", {"flag": True, "items": [True, None]})
+        s.commit()  # seq 2
+        r = s.diff(1, 2)
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "i", "value": True},
+                {
+                    "op": "set",
+                    "key": "nested",
+                    "value": {"flag": True, "items": [True, None]},
+                },
+            ],
+        )
+        self.assertIs(r.changes[0]["value"], True)
+
+    def test_invalid_arguments_raise_valueerror_before_log_read(self):
+        s = WalStore(self.path)
+        for bad in (True, False, -1, 1.5, "1", None, [1]):
+            with self.assertRaises(ValueError, msg=bad):
+                s.diff(bad, 0)
+            with self.assertRaises(ValueError, msg=bad):
+                s.diff(0, bad)
+        with self.assertRaises(ValueError):
+            s.diff(2, 1)
+        # rejected calls never create, read, or touch the log
+        self.assertFalse(self.path.exists())
+
+    def test_out_of_range_seqs_raise_valueerror(self):
+        s = self.build()  # latest committed seq is 3
+        with self.assertRaises(ValueError):
+            s.diff(0, 4)
+        with self.assertRaises(ValueError):
+            s.diff(4, 4)
+        with self.assertRaises(ValueError):
+            s.diff(3, 5)
+        # the store is untouched by the rejections
+        self.assertEqual((s.state, s.commit_seq), (WalStore(self.path).state, 3))
+
+    def test_closed_instance_raises_walclosederror_first(self):
+        s = self.build()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.diff(0, 1)
+        # closed takes priority over argument form checks
+        with self.assertRaises(app.WalClosedError):
+            s.diff("x", -1)
+        s.close()  # close stays idempotent
+
+    def test_corruption_raises_no_partial_result(self):
+        s = self.build()
+        before = self.log_bytes()
+        for junk in (
+            b'{"op": "set", "key": "x", "value": 1, "seq": 4, "extra": 1}\n',
+            b'{"op": "bogus", "seq": 4}\n',
+            b'{"op": "set", "key": "x", "value": 1, "seq": 9}\n',
+            b"not json\n",
+            b"\n",
+        ):
+            self.path.write_bytes(before + junk)
+            with self.assertRaises(WalCorruptionError, msg=junk):
+                s.diff(1, 2)
+            # memory state is never replaced by a failed diff
+            self.assertEqual(s.commit_seq, 3)
+        self.path.write_bytes(before)
+
+    def test_uncommitted_records_and_fragment_are_invisible(self):
+        s = self.build()
+        s.set("pending", 1)
+        s.delete("a")
+        self.append_bytes('{"op": "set", "key": "frag"')  # interrupted write
+        r = s.diff(1, 3)
+        self.assertEqual(
+            r.changes,
+            [
+                {"op": "set", "key": "b", "value": {"n": [1, True, 2]}},
+                {"op": "delete", "key": "c"},
+                {"op": "set", "key": "d", "value": None},
+            ],
+        )
+        self.assertEqual(s.diff(3, 3).changes, [])
+        with self.assertRaises(ValueError):
+            s.diff(0, 4)  # the pending batch is not a commit
+
+    def test_diff_is_strictly_read_only(self):
+        s = self.build()
+        s.set("pending", 1)
+        before = self.log_bytes()
+        state_before = s.state
+        for _ in range(2):
+            s.diff(0, 3)
+            s.diff(1, 2)
+        self.assertEqual(self.log_bytes(), before)
+        self.assertIs(s.state, state_before)
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.recover()["pending_count"], 1)
+        # the pending batch still commits exactly as before
+        self.assertEqual(s.commit(), 4)
+        self.assertEqual(s.state["pending"], 1)
+
+    def test_diff_then_append_still_drops_fragment(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "frag"')
+        size_with_fragment = self.log_bytes()
+        s.diff(1, 2)  # observational: must not consume the fragment
+        self.assertEqual(self.log_bytes(), size_with_fragment)
+        s.set("after", 1)
+        # the append truncated the fragment first, then added one record
+        self.assertEqual(
+            self.log_bytes(),
+            size_with_fragment[: -len(b'{"op": "set", "key": "frag"')]
+            + (json.dumps({"op": "set", "key": "after", "seq": 4, "value": 1}, sort_keys=True) + "\n").encode("utf-8"),
+        )
+
+    def test_result_is_independent_deep_copy(self):
+        s = self.build()
+        r = s.diff(1, 2)
+        r.changes[0]["value"]["n"].append(999)
+        r.changes.append({"op": "delete", "key": "caller"})
+        r.from_seq = 99
+        # the store and repeated calls are unaffected
+        again = s.diff(1, 2)
+        self.assertEqual(again.from_seq, 1)
+        self.assertEqual(
+            again.changes[0],
+            {"op": "set", "key": "b", "value": {"n": [1, True, 2]}},
+        )
+        self.assertEqual(len(again.changes), 3)
+        self.assertEqual(s.snapshot(2).state["b"], {"n": [1, True, 2]})
+
+    def test_deterministic_across_calls_and_reopens(self):
+        s = self.build()
+        first = s.diff(0, 3)
+        for _ in range(3):
+            self.assertEqual(s.diff(0, 3), first)
+        reopened = WalStore(self.path)
+        self.assertEqual(reopened.diff(0, 3), first)
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(ro.diff(0, 3), first)
+
+    def test_readonly_instance_diffs_without_lease(self):
+        writer = WalStore(self.path, exclusive=True)
+        writer.set("a", 1)
+        writer.commit()
+        writer.set("b", 2)
+        writer.commit()
+        ro = WalStore(self.path, readonly=True)  # opens beside the lease
+        self.assertEqual(
+            ro.diff(1, 2).changes, [{"op": "set", "key": "b", "value": 2}]
+        )
+        # a read-only diff never mutates and never creates anything
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.set("x", 1)
+        writer.close()
+        ro.close()
+
+    def test_readonly_diff_creates_nothing_for_missing_log(self):
+        s = WalStore(self.path, readonly=True)
+        self.assertEqual(s.diff(0, 0).changes, [])
+        self.assertFalse(self.path.exists())
+
+    def test_exclusive_diff_keeps_lease(self):
+        s = WalStore(self.path, exclusive=True)
+        s.set("a", 1)
+        s.commit()
+        s.set("a", 2)
+        s.commit()
+        self.assertEqual(
+            s.diff(1, 2).changes, [{"op": "set", "key": "a", "value": 2}]
+        )
+        # the lease is still held and writes still work
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        s.set("b", 3)
+        self.assertEqual(s.commit(), 3)
+        s.close()
+
+    def test_legacy_log_diffs_without_migration(self):
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "a", "value": 2, "seq": 2},
+            {"op": "delete", "key": "gone", "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.diff(1, 2).changes, [{"op": "set", "key": "a", "value": 2}]
+        )
+        self.assertEqual(s.diff(0, 1).changes, [{"op": "set", "key": "a", "value": 1}])
+
+    def test_mutations_after_diff_follow_existing_rules(self):
+        s = self.build()
+        s.diff(0, 3)
+        s.set("tail", 9)
+        s.delete("a")
+        self.assertEqual(s.rollback(), 2)
+        self.assertEqual(s.recover()["pending_count"], 0)
+        self.assertEqual(s.commit(), 4)  # empty commit
+        self.assertEqual(s.restore(1), 5)
+        self.assertEqual(
+            s.apply_batch(5, [{"op": "set", "key": "g", "value": 0}]), 6
+        )
+        self.assertEqual(
+            s.diff(5, 6).changes, [{"op": "set", "key": "g", "value": 0}]
+        )
+        self.append_bytes('{"op": "set", "key": "frag"')
+        r = s.repair_tail()
+        self.assertEqual(r.removed_bytes, len(b'{"op": "set", "key": "frag"'))
+        reopened = WalStore(self.path)
+        self.assertEqual(reopened.diff(0, 6), s.diff(0, 6))
+
+
 if __name__ == "__main__":
     unittest.main()
