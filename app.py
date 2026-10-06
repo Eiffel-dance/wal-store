@@ -39,7 +39,7 @@ class WalReadOnlyError(Exception):
 
 
 class WalPendingError(Exception):
-    """Raised by restore()/apply_batch() when the log is not settled.
+    """Raised by restore()/apply_batch()/apply_if_versions() when the log is not settled.
 
     Either complete, terminated set/delete records wait in an uncommitted
     batch, or an interrupted write leaves an unfinished tail fragment.
@@ -49,12 +49,13 @@ class WalPendingError(Exception):
 
 
 class WalConflictError(Exception):
-    """Raised by apply_batch() when the declared base seq is stale.
+    """Raised by apply_batch()/apply_if_versions() when a declared precondition is stale.
 
-    The caller-declared base commit seq does not match the log's latest
-    committed seq, so the batch's compare-and-swap precondition fails.
-    Nothing is written, truncated, or adopted; the caller is expected to
-    re-read the current state and retry with the up-to-date base.
+    The caller-declared base commit seq or per-key expected version does
+    not match the log's latest committed state, so the batch's
+    compare-and-swap precondition fails. Nothing is written, truncated, or
+    adopted; the caller is expected to re-read the current state and retry
+    with the up-to-date base.
     """
 
 
@@ -255,6 +256,83 @@ def _validate_expected_seq(expected_seq):
             "expected_seq must be a non-negative integer, got %r"
             % (expected_seq,)
         )
+
+
+def _validate_expected_versions(expected_versions):
+    # The version precondition mapping of apply_if_versions: string keys,
+    # each mapped to a non-boolean non-negative integer under the
+    # key_version rules (0 for a key no committed batch ever touched, the
+    # deleting commit's seq for a deleted key).
+    if not isinstance(expected_versions, dict):
+        raise ValueError(
+            "expected_versions must be a dict mapping keys to versions, "
+            "got %r" % (type(expected_versions).__name__,)
+        )
+    for key, version in expected_versions.items():
+        if not isinstance(key, str):
+            raise ValueError(
+                "expected_versions keys must be strings, got %r"
+                % (type(key).__name__,)
+            )
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version < 0
+        ):
+            raise ValueError(
+                "version for key %r must be a non-negative integer, got %r"
+                % (key, version)
+            )
+
+
+def _normalize_changes(changes):
+    # Validate and normalize an ordered set/delete change collection up
+    # front: a rejected call must never create, truncate, or append to the
+    # log or alter in-memory state. Values are deep-copied so the written
+    # records can never share mutable nested objects with the caller's
+    # collection.
+    if not isinstance(changes, (list, tuple)):
+        raise ValueError(
+            "changes must be a list of change records, got %r"
+            % (type(changes).__name__,)
+        )
+    normalized = []
+    for index, change in enumerate(changes):
+        if not isinstance(change, dict):
+            raise ValueError(
+                "change %r must be a dict, got %r"
+                % (index, type(change).__name__)
+            )
+        op = change.get("op")
+        if op == "set":
+            if set(change) != {"op", "key", "value"}:
+                raise ValueError(
+                    "set change %r must carry exactly op, key and value, "
+                    "got %r" % (index, sorted(change))
+                )
+            _validate_key(change["key"])
+            _validate_value(change["value"])
+            normalized.append(
+                {
+                    "op": "set",
+                    "key": change["key"],
+                    "value": copy.deepcopy(change["value"]),
+                }
+            )
+        elif op == "delete":
+            if set(change) != {"op", "key"}:
+                raise ValueError(
+                    "delete change %r must carry exactly op and key, "
+                    "got %r" % (index, sorted(change))
+                )
+            _validate_key(change["key"])
+            normalized.append({"op": "delete", "key": change["key"]})
+        else:
+            raise ValueError(
+                "change %r has unknown op %r: only 'set' and 'delete' "
+                "records may be batched" % (index, op)
+            )
+    return normalized
 
 
 def _reject_constant(constant):
@@ -977,42 +1055,7 @@ class WalStore:
         # in-memory state. Values are deep-copied so the written records
         # can never share mutable nested objects with the caller's
         # collection.
-        normalized = []
-        for index, change in enumerate(changes):
-            if not isinstance(change, dict):
-                raise ValueError(
-                    "change %r must be a dict, got %r"
-                    % (index, type(change).__name__)
-                )
-            op = change.get("op")
-            if op == "set":
-                if set(change) != {"op", "key", "value"}:
-                    raise ValueError(
-                        "set change %r must carry exactly op, key and value, "
-                        "got %r" % (index, sorted(change))
-                    )
-                _validate_key(change["key"])
-                _validate_value(change["value"])
-                normalized.append(
-                    {
-                        "op": "set",
-                        "key": change["key"],
-                        "value": copy.deepcopy(change["value"]),
-                    }
-                )
-            elif op == "delete":
-                if set(change) != {"op", "key"}:
-                    raise ValueError(
-                        "delete change %r must carry exactly op and key, "
-                        "got %r" % (index, sorted(change))
-                    )
-                _validate_key(change["key"])
-                normalized.append({"op": "delete", "key": change["key"]})
-            else:
-                raise ValueError(
-                    "change %r has unknown op %r: only 'set' and 'delete' "
-                    "records may be batched" % (index, op)
-                )
+        normalized = _normalize_changes(changes)
         # Full recover-rule validation of the log, purely into local
         # objects: corruption raises WalCorruptionError before anything is
         # written, truncated, or adopted.
@@ -1196,6 +1239,116 @@ class WalStore:
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()
+
+    def apply_if_versions(self, expected_versions, changes):
+        """Atomically commit a batch guarded by many keys' versions.
+
+        The multi-key compare-and-swap entry: ``expected_versions`` maps
+        each guarded key to the key_version the caller observed before
+        deciding to write, and the whole batch goes through as one new
+        commit only when every mapped key's version in the latest complete
+        commit still equals its declared value. On success the changes are
+        appended in the caller's order -- the same key may appear several
+        times, each record acting on the batch's running state -- and the
+        batch is sealed by one new commit record whose seq is the latest
+        committed seq + 1, exactly as apply_batch does. Returns the new
+        commit_seq; state, recover, snapshot, history, diff, scan,
+        key_version, and a reopen all reflect the complete batch. An empty
+        changes collection is an empty commit: no change records, one
+        commit record, seq advancing by one.
+
+        ``expected_versions`` must be a dict with string keys and
+        non-boolean non-negative integer versions under the key_version
+        rules: 0 requires the key to be absent from every committed batch,
+        and a deleted key keeps the seq of the commit that deleted it.
+        ``changes`` must be a list or tuple whose items carry exactly the
+        existing record semantics -- {"op": "set", "key", "value"} or
+        {"op": "delete", "key"} -- with string keys and values under the
+        existing JSON-compatibility rules (deep-copied into the written
+        records). Every key touched by changes must appear in
+        expected_versions; the mapping may additionally name keys used
+        only for validation. Every argument error raises ValueError before
+        the log is read or created; a closed instance raises
+        WalClosedError and a read-only one WalReadOnlyError before any
+        argument is checked, exactly as the other mutating entries do.
+
+        The log is then validated under the exact recover rules (any
+        corruption raises WalCorruptionError) and must be settled at the
+        last commit: complete uncommitted set/delete records or a
+        recover/audit-recognisable unfinished tail fragment raise
+        WalPendingError. Every version comparison is made against the
+        latest complete commit at validation time -- pending records and a
+        discardable tail fragment never move a key's version -- and any
+        mismatch raises WalConflictError. None of these rejections
+        appends, truncates, or alters in-memory state, and no seq is
+        consumed.
+
+        The write phase follows the same single-writer lease, per-record
+        flush+fsync, and seq monotonicity rules as apply_batch: an OSError
+        from any change record or the final commit propagates unchanged,
+        the already-durable prefix stays observable through
+        pending_changes and removable through rollback, neither the
+        in-memory state nor commit_seq advances, and a process terminated
+        at any write boundary recovers to the last complete commit on
+        reopen with the unsealed part of the batch never applied.
+        """
+        self._check_writable()
+        _validate_expected_versions(expected_versions)
+        normalized = _normalize_changes(changes)
+        # Every key the batch touches must be guarded by the mapping; the
+        # mapping itself may name additional validation-only keys.
+        for change in normalized:
+            if change["key"] not in expected_versions:
+                raise ValueError(
+                    "change key %r is missing from expected_versions"
+                    % (change["key"],)
+                )
+        # Full recover-rule validation of the log, purely into local
+        # objects: corruption raises WalCorruptionError before anything is
+        # written, truncated, or adopted.
+        batches = []
+        (
+            _candidate,
+            committed,
+            pending_count,
+            _valid_size,
+            _committed_size,
+        ) = self._replay(batches=batches)
+        # The log must be settled at the last commit before a new batch is
+        # spliced on: neither complete uncommitted records nor a
+        # recognisable unfinished tail fragment may be present (same rule
+        # as restore, apply_batch, and the single-key conditional writes).
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > self._valid_size:
+            raise WalPendingError(
+                "log is not settled at commit %r: %r pending record(s), "
+                "an unfinished tail fragment is present"
+                % (committed, pending_count)
+            )
+        # Compare every guarded key against its version in the latest
+        # complete commit only.
+        for key, expected in expected_versions.items():
+            version = _version_of_key(batches, key)
+            if version != expected:
+                raise WalConflictError(
+                    "key %r is at version %r, not expected version %r"
+                    % (key, version, expected)
+                )
+        # Append each change record and then the sealing commit, one
+        # durable record at a time, exactly as apply_batch does. An
+        # OSError propagates with the old committed state and seq in
+        # place; the already-written records form the batch's pending
+        # tail.
+        new_seq = committed + 1
+        for change in normalized:
+            record = dict(change)
+            record["seq"] = new_seq
+            self._append(record)
+        self._append({"op": "commit", "seq": new_seq})
+        # Adopt the new committed view only once its commit boundary is
+        # durable, exactly as commit() does.
+        self.recover()
+        return self.commit_seq
 
     def _committed_view(self):
         # Replay the log purely into local objects, exactly like recovery, but
