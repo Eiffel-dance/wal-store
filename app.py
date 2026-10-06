@@ -2053,7 +2053,6 @@ class WalStore:
                         raise WalCorruptionError(
                             "integrity metadata mismatch for seq %r" % (seq,)
                         )
-                    chain = expected_ic
                 if not terminated:
                     # The record's terminator never became durable, so the
                     # write is unfinished: the fragment is discarded whole --
@@ -2061,8 +2060,15 @@ class WalStore:
                     # beyond valid_size for a later append or rollback to
                     # remove. Validation above has already run, so only a
                     # fragment that is recognisably one complete record
-                    # reaches this point; anything else raised already.
+                    # reaches this point; anything else raised already. The
+                    # integrity chain head is NOT advanced past it either:
+                    # the fragment's bytes are removed by the next append or
+                    # rollback, so the next record must chain onto the last
+                    # adopted (terminated) record, exactly as valid_size
+                    # only covers the accepted prefix.
                     break
+                if log_protected:
+                    chain = expected_ic
                 if op == "commit":
                     if batches is not None:
                         # The batch's changes in original log order, with
