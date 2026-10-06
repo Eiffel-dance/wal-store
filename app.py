@@ -228,6 +228,35 @@ def _json_equal(a, b):
     return a == b
 
 
+def _version_of_key(batches, key):
+    """Commit seq of the last committed batch that set or deleted ``key``.
+
+    ``batches`` is the (seq, changes) list recorded by a replay; only
+    committed batches appear in it, so pending records and discarded tail
+    fragments can never move a key's version. A key no committed batch
+    ever touched has version 0, and a deleted key keeps the seq of the
+    commit that deleted it.
+    """
+    version = 0
+    for seq, changes in batches:
+        for change in changes:
+            if change["key"] == key:
+                version = seq
+    return version
+
+
+def _validate_expected_seq(expected_seq):
+    if (
+        isinstance(expected_seq, bool)
+        or not isinstance(expected_seq, int)
+        or expected_seq < 0
+    ):
+        raise ValueError(
+            "expected_seq must be a non-negative integer, got %r"
+            % (expected_seq,)
+        )
+
+
 def _reject_constant(constant):
     # NaN / Infinity / -Infinity are non-standard JSON constants; a record
     # containing them is corruption, never silently parsed as a float.
@@ -1025,6 +1054,149 @@ class WalStore:
         self.recover()
         return self.commit_seq
 
+    def set_if_version(self, key, expected_seq, value):
+        """Optimistically write one set record, guarded by the key's version.
+
+        The single-writer compare-and-swap entry for one key: the caller
+        declares with ``expected_seq`` the key_version it observed before
+        deciding to write, and the write goes through only when the key's
+        version in the latest complete commit still equals it. On success
+        one set record and one commit record are appended -- exactly as if
+        set(key, value) were followed by commit() -- and the new commit
+        seq is returned; state, recover, snapshot, history, diff, scan,
+        pending_changes, and key_version then all reflect the same
+        committed result.
+
+        ``key`` must be a string and ``value`` follows the existing
+        JSON-compatibility rules (it is deep-copied into the written
+        record, so the store never shares mutable nested objects with the
+        caller). ``expected_seq`` must be a non-boolean non-negative
+        integer: 0 requires the key to be absent from every committed
+        batch, and any larger value requires the key's last committed
+        touch -- set or delete -- to carry exactly that commit seq. Every
+        argument error raises ValueError before the log is touched; a
+        closed instance raises WalClosedError and a read-only one
+        WalReadOnlyError before any argument is checked, exactly as the
+        other mutating entries do.
+
+        The log is then validated under the exact recover rules (any
+        corruption raises WalCorruptionError) and must be settled at the
+        last commit: complete uncommitted set/delete records or a
+        recover/audit-recognisable unfinished tail fragment raise
+        WalPendingError, and a key version that no longer matches raises
+        WalConflictError, the comparison always made against the latest
+        complete commit. None of these rejections appends, truncates, or
+        alters in-memory state.
+
+        The write phase follows the same single-writer lease, per-record
+        flush+fsync, and seq monotonicity rules as set/commit: an OSError
+        from either record propagates unchanged, a set record already
+        durable but not yet sealed stays observable through
+        pending_changes and removable through rollback, neither state nor
+        commit_seq advances, and a process terminated at any write
+        boundary recovers to the previous commit on reopen.
+        """
+        self._check_writable()
+        _validate_key(key)
+        _validate_expected_seq(expected_seq)
+        _validate_value(value)
+        self._commit_if_version(
+            key,
+            expected_seq,
+            {"op": "set", "key": key, "value": copy.deepcopy(value)},
+        )
+        return self.commit_seq
+
+    def delete_if_version(self, key, expected_seq):
+        """Optimistically write one delete record, guarded by the key's version.
+
+        The delete counterpart of set_if_version: the write goes through
+        only when the key's version in the latest complete commit equals
+        ``expected_seq`` -- for a live key the seq of the commit that last
+        set it, for an already-deleted key the seq of the commit that
+        deleted it, and 0 for a key no committed batch ever touched. On
+        success one delete record and one commit record are appended --
+        exactly as if delete(key) were followed by commit() -- and the new
+        commit seq is returned; state, recover, snapshot, history, diff,
+        scan, pending_changes, and key_version then all reflect the same
+        committed result.
+
+        ``key`` must be a string and ``expected_seq`` a non-boolean
+        non-negative integer; every argument error raises ValueError
+        before the log is touched, a closed instance raises
+        WalClosedError, and a read-only one WalReadOnlyError, with the
+        same priority as the other mutating entries. The log is validated
+        under the exact recover rules (corruption raises
+        WalCorruptionError) and must be settled at the last commit:
+        complete uncommitted records or a recognisable unfinished tail
+        fragment raise WalPendingError, and a stale expected_seq raises
+        WalConflictError against the latest complete commit. None of
+        these rejections appends, truncates, or alters in-memory state.
+
+        Durability follows the set/commit rules: each record is flushed
+        and fsynced as it is written, an OSError propagates with the old
+        committed state and seq in place, a delete record already durable
+        but not yet sealed stays observable through pending_changes and
+        removable through rollback, and a process terminated at any write
+        boundary recovers to the previous commit on reopen.
+        """
+        self._check_writable()
+        _validate_key(key)
+        _validate_expected_seq(expected_seq)
+        self._commit_if_version(
+            key, expected_seq, {"op": "delete", "key": key}
+        )
+        return self.commit_seq
+
+    def _commit_if_version(self, key, expected_seq, record):
+        """Validate, check the version precondition, and commit one record.
+
+        Shared write path of set_if_version/delete_if_version; every
+        argument has already been validated and every value deep-copied by
+        the caller. The log is replayed under the exact recover rules
+        purely into local objects, so corruption raises WalCorruptionError
+        before anything is written, truncated, or adopted. The log must
+        be settled at the last commit (same rule as restore and
+        apply_batch): neither complete uncommitted records nor a
+        recognisable unfinished tail fragment may be present. The
+        precondition compares expected_seq against the key's version in
+        the latest complete commit only -- pending records and a
+        discardable tail fragment never move it.
+        """
+        batches = []
+        (
+            _candidate,
+            committed,
+            pending_count,
+            _valid_size,
+            _committed_size,
+        ) = self._replay(batches=batches)
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > self._valid_size:
+            raise WalPendingError(
+                "log is not settled at commit %r: %r pending record(s), "
+                "an unfinished tail fragment is present"
+                % (committed, pending_count)
+            )
+        version = _version_of_key(batches, key)
+        if version != expected_seq:
+            raise WalConflictError(
+                "key %r is at version %r, not expected version %r"
+                % (key, version, expected_seq)
+            )
+        # Append the change record and then the sealing commit, one
+        # durable record at a time, exactly as apply_batch does. An
+        # OSError propagates with the old committed state and seq in
+        # place; an already-written change record forms the pending tail.
+        new_seq = committed + 1
+        record = dict(record)
+        record["seq"] = new_seq
+        self._append(record)
+        self._append({"op": "commit", "seq": new_seq})
+        # Adopt the new committed view only once its commit boundary is
+        # durable, exactly as commit() does.
+        self.recover()
+
     def _committed_view(self):
         # Replay the log purely into local objects, exactly like recovery, but
         # never adopt the result: a query must observe the last durable commit
@@ -1055,6 +1227,45 @@ class WalStore:
         _validate_key(key)
         state, _committed = self._committed_view()
         return key in state
+
+    def key_version(self, key):
+        """Read-only per-key version of the last committed write.
+
+        Returns the commit seq of the most recent complete commit whose
+        batch set or deleted ``key``: a key no committed batch ever
+        touched yields 0, a deleted key keeps the seq of the commit that
+        deleted it, and commits that never touched the key leave its
+        version unchanged. Only the last complete commit boundary is
+        observed -- complete but uncommitted set/delete records and a
+        discardable trailing write fragment are invisible, so the version
+        always names a committed state the caller could have read.
+
+        The whole log is validated under the exact recover rules first:
+        a missing or empty log yields 0 (and is never created), any
+        corruption raises WalCorruptionError with no partial result, a
+        closed instance raises WalClosedError before the key is even
+        validated, and a non-string key raises ValueError before the log
+        is read. The query never appends, truncates, or rewrites the log
+        and never changes state, commit_seq, pending_count, or the cached
+        accepted-prefix boundary a later append relies on; repeated calls
+        on the same acceptable log prefix, including after a reopen,
+        return the same version. It is the read half of
+        set_if_version/delete_if_version: the seq it returns is exactly
+        the expected_seq those entries compare against.
+        """
+        self._check_open()
+        _validate_key(key)
+        batches = []
+        # Purely observational replay, exactly as in scan, diff, and
+        # pending_changes: restore the cached accepted-prefix boundary so
+        # the query can never influence a later append's decision to drop
+        # a tail fragment.
+        saved_valid_size = self._valid_size
+        try:
+            self._replay(batches=batches)
+        finally:
+            self._valid_size = saved_valid_size
+        return _version_of_key(batches, key)
 
     def scan(self, start_key=None, end_key=None, limit=None):
         """Read-only deterministic range scan of the last committed view.
