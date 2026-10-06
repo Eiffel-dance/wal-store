@@ -1932,8 +1932,16 @@ class WalStore:
         # by the first parsed record (None until then) and must agree with
         # every later record -- protected and unprotected records may never
         # mix. chain is the running digest the next record must chain onto.
+        # accepted_chain is the digest just past the last *terminated,
+        # accepted* record: a discarded tail fragment is verified against
+        # the running chain (so only a recognisably valid record qualifies
+        # as a fragment) but its digest is never adopted, because the
+        # fragment's bytes sit beyond valid_size and a later append or
+        # rollback removes them -- a chain head anchored to removed bytes
+        # could never verify again.
         log_protected = None
         chain = _CHAIN_SEED
+        accepted_chain = _CHAIN_SEED
         if self.path.exists():
             data = self.path.read_bytes()
             try:
@@ -2061,8 +2069,13 @@ class WalStore:
                     # beyond valid_size for a later append or rollback to
                     # remove. Validation above has already run, so only a
                     # fragment that is recognisably one complete record
-                    # reaches this point; anything else raised already.
+                    # reaches this point; anything else raised already. Its
+                    # digest is likewise not adopted into the accepted chain
+                    # head: the fragment's bytes are about to be truncated,
+                    # and the next protected record must chain onto the last
+                    # terminated record's digest instead.
                     break
+                accepted_chain = chain
                 if op == "commit":
                     if batches is not None:
                         # The batch's changes in original log order, with
@@ -2135,7 +2148,7 @@ class WalStore:
                     % (str(self.path),)
                 )
             self._protected = False
-        self._chain_head = chain
+        self._chain_head = accepted_chain
         self._valid_size = valid_size
         return candidate, committed, len(pending), valid_size, committed_size
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import tempfile
@@ -6075,6 +6076,934 @@ class ApplyIfVersionsTest(unittest.TestCase):
             for line in self.path.read_text().splitlines()
         ]
         self.assertTrue(all("ic" in row for row in rows))
+
+
+class CrashConsistencyTest(unittest.TestCase):
+    """Terminate-the-process-at-any-point crash consistency tests.
+
+    A crash is simulated by writing the log bytes exactly as they would
+    exist if the process died at that instant -- the committed base log
+    plus a cut through the records the operation was appending -- and
+    then opening a fresh WalStore on those bytes. Cuts land inside a
+    record (before its terminator), after a complete change record but
+    before the commit record, inside the commit record, and just past
+    the durable commit. Every assertion uses only public return values,
+    raised exceptions, and the log's byte boundaries.
+    """
+
+    BASE_STATE = {"b": {"n": [1, 2]}, "c": [True, None]}
+    BASE_SEQ = 2
+    FRAGMENT = '{"op": "set", "key": "frag"'
+    OPERATIONS = (
+        "set",
+        "delete",
+        "commit",
+        "restore",
+        "apply_batch",
+        "set_if_version",
+        "delete_if_version",
+        "apply_if_versions",
+    )
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    # ----- log construction helpers -------------------------------------
+
+    def make_base(self, path, mode):
+        """A fresh base input log: empty, legacy-format, or protected."""
+        if path.exists():
+            path.unlink()
+        if mode == "empty":
+            return b""
+        s = WalStore(path, integrity=(mode == "protected"))
+        s.set("a", 1)
+        s.set("b", {"n": [1, 2]})
+        s.commit()  # seq 1: {"a": 1, "b": {"n": [1, 2]}}
+        s.delete("a")
+        s.set("c", [True, None])
+        s.commit()  # seq 2: {"b": {"n": [1, 2]}, "c": [True, None]}
+        s.close()
+        return path.read_bytes()
+
+    def run_op(self, path, mode, op_name):
+        """Perform one write operation on top of the base log."""
+        s = WalStore(path, integrity=(mode == "protected"))
+        base_seq = s.commit_seq
+        if op_name == "set":
+            s.set("x", 9)
+        elif op_name == "delete":
+            s.delete("c")
+        elif op_name == "commit":
+            s.set("z", 5)
+            s.commit()
+        elif op_name == "restore":
+            s.restore(1 if base_seq else 0)
+        elif op_name == "apply_batch":
+            s.apply_batch(
+                base_seq,
+                [
+                    {"op": "set", "key": "x", "value": 9},
+                    {"op": "delete", "key": "c"},
+                    {"op": "set", "key": "b", "value": "new"},
+                ],
+            )
+        elif op_name == "set_if_version":
+            s.set_if_version("c", base_seq, "newc")
+        elif op_name == "delete_if_version":
+            s.delete_if_version("c", base_seq)
+        elif op_name == "apply_if_versions":
+            s.apply_if_versions(
+                {"x": 0, "c": base_seq},
+                [
+                    {"op": "set", "key": "x", "value": 9},
+                    {"op": "delete", "key": "c"},
+                ],
+            )
+        else:
+            raise AssertionError(op_name)
+        s.close()
+
+    def capture_operation(self, mode, op_name):
+        """Run one operation on a reference log; return (base, appended)."""
+        ref = Path(self.dir.name) / ("ref-%s-%s.wal" % (mode, op_name))
+        base = self.make_base(ref, mode)
+        self.run_op(ref, mode, op_name)
+        appended = ref.read_bytes()[len(base):]
+        ref.unlink()
+        return base, appended
+
+    @staticmethod
+    def cut_points(appended):
+        """Crash offsets: inside each record, just before its terminator,
+        just past it, and before the first byte of the operation."""
+        cuts = {0}
+        pos = 0
+        for line in appended.splitlines(keepends=True):
+            end = pos + len(line)
+            cuts.add(pos + 1)  # a lone "{"
+            cuts.add(pos + max(1, len(line) // 2))  # mid-record
+            cuts.add(end - 1)  # complete record, terminator never durable
+            cuts.add(end)  # record fully written
+            pos = end
+        return sorted(cuts)
+
+    def replay_expectation(self, mode, base, appended, cut):
+        """Expected public view after a crash at byte ``cut`` of the op."""
+        if mode == "empty":
+            state, committed = {}, 0
+        else:
+            state, committed = dict(self.BASE_STATE), self.BASE_SEQ
+        committed_bytes = len(base) if committed else 0
+        records = [
+            json.loads(line)
+            for line in appended.decode("utf-8").splitlines()
+        ]
+        offsets = []
+        pos = 0
+        for line in appended.splitlines(keepends=True):
+            pos += len(line)
+            offsets.append(pos)
+        n_complete = appended[:cut].count(b"\n")
+        valid_bytes = len(base) + (offsets[n_complete - 1] if n_complete else 0)
+        batch = []
+        for i in range(n_complete):
+            rec = records[i]
+            if rec["op"] == "commit":
+                for change in batch:
+                    if change["op"] == "delete":
+                        state.pop(change["key"], None)
+                    else:
+                        state[change["key"]] = change["value"]
+                batch = []
+                committed = rec["seq"]
+                committed_bytes = len(base) + offsets[i]
+            else:
+                batch.append(rec)
+        tail_bytes = (len(base) + cut) - valid_bytes
+        return state, committed, batch, valid_bytes, committed_bytes, tail_bytes
+
+    # ----- the crash matrix ----------------------------------------------
+
+    def check_cut(self, mode, base, appended, cut):
+        cut_data = base + appended[:cut]
+        self.path.write_bytes(cut_data)
+        (
+            state,
+            committed,
+            batch,
+            valid_bytes,
+            committed_bytes,
+            tail_bytes,
+        ) = self.replay_expectation(mode, base, appended, cut)
+        pending = len(batch)
+        s = WalStore(self.path)
+        try:
+            # RecoveryResult and the adopted public state: exactly the
+            # last complete commit, never the crashed tail.
+            r = s.recover()
+            self.assertEqual(r["state"], state)
+            self.assertEqual(r["commit_seq"], committed)
+            self.assertEqual(r["pending_count"], pending)
+            self.assertEqual(
+                (r.state, r.commit_seq, r.pending_count),
+                (state, committed, pending),
+            )
+            self.assertEqual((s.state, s.commit_seq), (state, committed))
+            # a second reopen replays the crashed log identically
+            again = WalStore(self.path)
+            r2 = again.recover()
+            self.assertEqual(
+                (r2["state"], r2["commit_seq"], r2["pending_count"]),
+                (state, committed, pending),
+            )
+            again.close()
+            # snapshot / history / diff / scan serve the committed view
+            self.assertEqual(
+                s.snapshot(), {"state": state, "commit_seq": committed}
+            )
+            self.assertEqual(s.snapshot(committed)["state"], state)
+            if mode != "empty":
+                self.assertEqual(
+                    s.snapshot(1)["state"], {"a": 1, "b": {"n": [1, 2]}}
+                )
+            self.assertEqual(
+                [h["commit_seq"] for h in s.history()],
+                list(range(1, committed + 1)),
+            )
+            d = s.diff(0, committed)
+            self.assertEqual((d["from_seq"], d["to_seq"]), (0, committed))
+            self.assertEqual(
+                d["changes"],
+                [
+                    {"op": "set", "key": k, "value": v}
+                    for k, v in sorted(state.items())
+                ],
+            )
+            self.assertEqual(s.diff(committed, committed)["changes"], [])
+            self.assertEqual(
+                s.scan(),
+                [{"key": k, "value": v} for k, v in sorted(state.items())],
+            )
+            # pending_changes and audit: complete terminated records stay
+            # pending; the unfinished tail is neither applied nor counted
+            pc = s.pending_changes()
+            self.assertEqual(
+                (pc["commit_seq"], pc["pending_count"]), (committed, pending)
+            )
+            stripped = [
+                {"op": "delete", "key": rec["key"]}
+                if rec["op"] == "delete"
+                else {"op": "set", "key": rec["key"], "value": rec["value"]}
+                for rec in batch
+            ]
+            self.assertEqual(pc["changes"], stripped)
+            a = s.audit()
+            self.assertEqual(
+                (a["state"], a["commit_seq"], a["pending_count"]),
+                (state, committed, pending),
+            )
+            self.assertEqual(
+                (a["valid_bytes"], a["committed_bytes"], a["tail_bytes"]),
+                (valid_bytes, committed_bytes, tail_bytes),
+            )
+            # query visibility: pending records and the fragment are
+            # invisible; only the committed state is served
+            for rec in batch:
+                key = rec["key"]
+                if key in state:
+                    self.assertEqual(s.get(key), state[key])
+                    self.assertIs(s.contains(key), True)
+                else:
+                    self.assertIs(s.contains(key), False)
+                    with self.assertRaises(KeyError):
+                        s.get(key)
+            for key, value in state.items():
+                self.assertEqual(s.get(key), value)
+            # no read-only entry moved the log's bytes
+            self.assertEqual(self.path.read_bytes(), cut_data)
+            # integrity=True agrees on a protected crashed log
+            if mode == "protected":
+                si = WalStore(self.path, integrity=True)
+                ri = si.recover()
+                self.assertEqual(
+                    (ri["state"], ri["commit_seq"], ri["pending_count"]),
+                    (state, committed, pending),
+                )
+                si.close()
+            # continuation: the seq chain advances from the replayed
+            # commit, monotonically and without reuse
+            s.set("zz", 7)
+            self.assertEqual(s.commit(), committed + 1)
+            data = self.path.read_bytes()
+            # the accepted prefix is preserved byte for byte; the
+            # fragment is gone and the new records chain onto the replay
+            self.assertEqual(data[:valid_bytes], cut_data[:valid_bytes])
+            new_rows = [
+                json.loads(line)
+                for line in data[valid_bytes:].decode("utf-8").splitlines()
+            ]
+            self.assertEqual(len(new_rows), 2)
+            self.assertEqual(new_rows[0]["op"], "set")
+            self.assertEqual(new_rows[0]["key"], "zz")
+            self.assertEqual(new_rows[0]["seq"], committed + 1)
+            self.assertEqual(new_rows[1]["op"], "commit")
+            self.assertEqual(new_rows[1]["seq"], committed + 1)
+            if mode == "protected":
+                self.assertIn("ic", new_rows[0])
+                self.assertIn("ic", new_rows[1])
+            elif mode == "legacy":
+                self.assertNotIn("ic", new_rows[0])
+                self.assertNotIn("ic", new_rows[1])
+            s.close()
+            continued = dict(state)
+            for rec in batch:
+                if rec["op"] == "delete":
+                    continued.pop(rec["key"], None)
+                else:
+                    continued[rec["key"]] = rec["value"]
+            continued["zz"] = 7
+            s3 = WalStore(self.path)
+            self.assertEqual(
+                (s3.state, s3.commit_seq), (continued, committed + 1)
+            )
+            s3.close()
+        finally:
+            s.close()
+        # rollback on a fresh copy of the same crashed log: the pending
+        # records and the fragment are removed at exactly the committed
+        # byte boundary, and the seq chain continues unreused
+        self.path.write_bytes(cut_data)
+        s4 = WalStore(self.path)
+        try:
+            self.assertEqual(s4.rollback(), pending)
+            self.assertEqual(self.path.stat().st_size, committed_bytes)
+            r4 = s4.recover()
+            self.assertEqual(
+                (r4["state"], r4["commit_seq"], r4["pending_count"]),
+                (state, committed, 0),
+            )
+            self.assertEqual(s4.commit(), committed + 1)
+        finally:
+            s4.close()
+
+    def check_scenario(self, mode, op_name):
+        base, appended = self.capture_operation(mode, op_name)
+        self.assertTrue(appended)  # every operation appends a record
+        for cut in self.cut_points(appended):
+            with self.subTest(mode=mode, op=op_name, cut=cut):
+                self.check_cut(mode, base, appended, cut)
+
+    def test_crash_at_every_record_boundary(self):
+        for mode in ("empty", "legacy", "protected"):
+            for op_name in self.OPERATIONS:
+                self.check_scenario(mode, op_name)
+
+    # ----- targeted crash shapes ------------------------------------------
+
+    def test_crash_mid_multibyte_character(self):
+        base = self.make_base(self.path, "legacy")
+        record = json.dumps(
+            {"op": "set", "key": "hé", "value": 1, "seq": 3},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        e_acute = "é".encode("utf-8")
+        split = record.index(e_acute) + 1  # inside the two-byte character
+        for cut in (split, len(record)):
+            with self.subTest(cut=cut):
+                self.path.write_bytes(base + record[:cut])
+                s = WalStore(self.path)
+                r = s.recover()
+                self.assertEqual(
+                    (r["state"], r["commit_seq"], r["pending_count"]),
+                    (self.BASE_STATE, self.BASE_SEQ, 0),
+                )
+                a = s.audit()
+                self.assertEqual(a["valid_bytes"], len(base))
+                self.assertEqual(a["tail_bytes"], cut)
+                s.close()
+        # the same record with its terminator is a complete pending record
+        self.path.write_bytes(base + record + b"\n")
+        s = WalStore(self.path)
+        r = s.recover()
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (2, 1))
+        self.assertEqual(
+            s.pending_changes()["changes"],
+            [{"op": "set", "key": "hé", "value": 1}],
+        )
+        self.assertIs(s.contains("hé"), False)  # still uncommitted
+        s.close()
+
+    def test_handwritten_legacy_log_with_crash_fragment(self):
+        rows = [
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "k", "value": 2, "seq": 2},
+        ]
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+            f.write('{"op": "commit", "seq": 2')  # crash mid commit record
+        s = WalStore(self.path)
+        r = s.recover()
+        self.assertEqual(
+            (r["state"], r["commit_seq"], r["pending_count"]),
+            ({"k": 1}, 1, 1),
+        )
+        # the unfinished commit never advanced the seq; committing now
+        # commits the pending set as exactly seq 2
+        self.assertEqual(s.commit(), 2)
+        s.close()
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"k": 2}, 2))
+        # the legacy log stays legacy: no integrity fields appear
+        self.assertNotIn(b'"ic"', self.path.read_bytes())
+        s2.close()
+
+    def test_crash_reopen_results_are_independent_copies(self):
+        self.make_base(self.path, "legacy")
+        s = WalStore(self.path)
+        s.set("n", {"k": [1]})
+        s.close()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(self.FRAGMENT)
+        s2 = WalStore(self.path)
+        pc = s2.pending_changes()
+        pc["changes"][0]["value"]["k"].append(99)
+        self.assertEqual(
+            s2.pending_changes()["changes"],
+            [{"op": "set", "key": "n", "value": {"k": [1]}}],
+        )
+        r = s2.recover()
+        r["state"]["b"]["n"].append(99)
+        self.assertEqual(s2.state, self.BASE_STATE)
+        snap = s2.snapshot()
+        snap["state"]["b"]["n"].append(99)
+        self.assertEqual(s2.snapshot()["state"], self.BASE_STATE)
+        hist = s2.history()
+        hist[0]["changes"][1]["value"]["n"].append(99)
+        self.assertEqual(s2.history()[0]["changes"][1]["value"], {"n": [1, 2]})
+        items = s2.scan()
+        items[0]["value"]["n"].append(99)
+        self.assertEqual(s2.scan()[0]["value"], {"n": [1, 2]})
+        a = s2.audit()
+        a["state"]["b"]["n"].append(99)
+        self.assertEqual(s2.audit()["state"], self.BASE_STATE)
+        s2.close()
+
+    # ----- fsync failure at write boundaries ------------------------------
+
+    def test_fsync_failure_on_commit_record_keeps_old_commit(self):
+        for mode in ("legacy", "protected"):
+            with self.subTest(mode=mode):
+                base = self.make_base(self.path, mode)
+                s = WalStore(self.path, integrity=(mode == "protected"))
+                s.set("x", 9)  # durable pending record
+                with mock.patch(
+                    "app.os.fsync", side_effect=OSError("disk on fire")
+                ):
+                    with self.assertRaises(OSError):
+                        s.commit()
+                # the old committed state never advanced in memory
+                self.assertEqual(
+                    (s.state, s.commit_seq), (self.BASE_STATE, self.BASE_SEQ)
+                )
+                s.close()
+                # the failed commit record is gone; the pending set remains
+                s2 = WalStore(self.path)
+                r = s2.recover()
+                self.assertEqual(
+                    (r["state"], r["commit_seq"], r["pending_count"]),
+                    (self.BASE_STATE, self.BASE_SEQ, 1),
+                )
+                # the seq was not consumed: the retry is still seq 3
+                self.assertEqual(s2.commit(), 3)
+                self.assertEqual(s2.state["x"], 9)
+                s2.close()
+                self.assertEqual(
+                    WalStore(self.path).commit_seq, self.BASE_SEQ + 1
+                )
+
+    def test_fsync_failure_mid_batch_keeps_durable_prefix_pending(self):
+        for mode in ("legacy", "protected"):
+            with self.subTest(mode=mode):
+                base = self.make_base(self.path, mode)
+                s = WalStore(self.path, integrity=(mode == "protected"))
+                changes = [
+                    {"op": "set", "key": "x", "value": 9},
+                    {"op": "delete", "key": "c"},
+                ]
+                real_fsync = os.fsync
+                calls = []
+
+                def flaky(fd):
+                    calls.append(fd)
+                    if len(calls) == 3:  # the sealing commit record
+                        raise OSError("simulated crash")
+                    return real_fsync(fd)
+
+                with mock.patch("app.os.fsync", side_effect=flaky):
+                    with self.assertRaises(OSError):
+                        s.apply_batch(2, changes)
+                # neither state nor commit_seq advanced
+                self.assertEqual(
+                    (s.state, s.commit_seq), (self.BASE_STATE, self.BASE_SEQ)
+                )
+                s.close()
+                # the durable prefix stays pending and removable
+                s2 = WalStore(self.path)
+                pc = s2.pending_changes()
+                self.assertEqual(pc["commit_seq"], 2)
+                self.assertEqual(
+                    pc["changes"],
+                    [
+                        {"op": "set", "key": "x", "value": 9},
+                        {"op": "delete", "key": "c"},
+                    ],
+                )
+                self.assertEqual(s2.rollback(), 2)
+                self.assertEqual(self.path.read_bytes(), base)
+                # the failed seq was not consumed
+                self.assertEqual(s2.apply_batch(2, changes), 3)
+                self.assertEqual(s2.state, {"b": {"n": [1, 2]}, "x": 9})
+                s2.close()
+                self.assertEqual(WalStore(self.path).commit_seq, 3)
+
+    def test_fsync_failure_on_first_batch_record_leaves_log_untouched(self):
+        base = self.make_base(self.path, "legacy")
+        s = WalStore(self.path)
+
+        def boom(fd):
+            raise OSError("simulated crash")
+
+        with mock.patch("app.os.fsync", side_effect=boom):
+            with self.assertRaises(OSError):
+                s.apply_batch(2, [{"op": "set", "key": "x", "value": 9}])
+        self.assertEqual((s.state, s.commit_seq), (self.BASE_STATE, 2))
+        # the failed record was truncated back: the log is byte-identical
+        self.assertEqual(self.path.read_bytes(), base)
+        s.close()
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.recover()["pending_count"], 0)
+        self.assertEqual(
+            s2.apply_batch(2, [{"op": "set", "key": "x", "value": 9}]), 3
+        )
+        s2.close()
+
+    def test_fsync_failure_on_conditional_write_commit(self):
+        base = self.make_base(self.path, "legacy")
+        s = WalStore(self.path)
+        real_fsync = os.fsync
+        calls = []
+
+        def flaky(fd):
+            calls.append(fd)
+            if len(calls) == 2:  # the commit record of set_if_version
+                raise OSError("simulated crash")
+            return real_fsync(fd)
+
+        with mock.patch("app.os.fsync", side_effect=flaky):
+            with self.assertRaises(OSError):
+                s.set_if_version("c", 2, "newc")
+        self.assertEqual((s.state, s.commit_seq), (self.BASE_STATE, 2))
+        s.close()
+        s2 = WalStore(self.path)
+        # the durable set record stays pending, the key's version unmoved
+        self.assertEqual(
+            s2.pending_changes()["changes"],
+            [{"op": "set", "key": "c", "value": "newc"}],
+        )
+        self.assertEqual(s2.key_version("c"), 2)
+        self.assertEqual(s2.rollback(), 1)
+        self.assertEqual(self.path.read_bytes(), base)
+        # the seq was not consumed and the retry goes through
+        self.assertEqual(s2.set_if_version("c", 2, "newc"), 3)
+        s2.close()
+
+    # ----- corruption after the crash -------------------------------------
+
+    def corruption_variants(self, mode, base):
+        variants = [
+            b"\xff",  # illegal UTF-8
+            b'{"op": "set", "key": "x", "value": NaN, "seq": 3}\n',
+            b'{"op": "set", "op": "set", "key": "x", "value": 1, "seq": 3}\n',
+            b'{"op": "set", "key": "x", "seq": 3}\n',  # missing value
+            b'{"op": "commit", "seq": 3, "extra": 1}\n',  # wrong field set
+            b'{"op": "bogus", "seq": 3}\n',  # unknown op
+            b'{"op": "commit", "seq": 7}\n',  # seq jump
+            b'{"op": "commit", "seq": 2}\n',  # seq reuse
+            b"\n",  # blank record
+            b"[1, 2]\n",  # not an object
+            b'{"op": "set", "key": "x", "value": 1, "seq": 3}extra',
+        ]
+        if mode == "protected":
+            prev_ic = json.loads(base.decode("utf-8").splitlines()[-1])["ic"]
+
+            def chained(record):
+                core = json.dumps(record, sort_keys=True)
+                digest = hashlib.sha256(
+                    (prev_ic + "\n" + core).encode("utf-8")
+                ).hexdigest()
+                row = dict(record)
+                row["ic"] = digest
+                return (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+
+            def corrupt_ic(row_bytes):
+                text = row_bytes.decode("utf-8")
+                i = text.index('"ic": "') + len('"ic": "')
+                c = text[i]
+                return (
+                    text[:i] + ("0" if c != "0" else "1") + text[i + 1 :]
+                ).encode("utf-8")
+
+            # integrity digest mismatch on an otherwise valid record
+            variants.append(corrupt_ic(chained({"op": "commit", "seq": 3})))
+            # integrity-valid record with a seq jump
+            variants.append(chained({"op": "commit", "seq": 7}))
+            # integrity metadata present but the field set is wrong
+            variants.append(chained({"op": "commit", "seq": 3, "extra": 1}))
+            # unprotected record spliced into a protected log
+            variants.append(b'{"op": "commit", "seq": 3}\n')
+        return variants
+
+    def test_corruption_after_crash_raises_everywhere(self):
+        for mode in ("legacy", "protected"):
+            base = self.make_base(self.path, mode)
+            for tail in self.corruption_variants(mode, base):
+                with self.subTest(mode=mode, tail=tail):
+                    corrupted = base + tail
+                    self.path.write_bytes(corrupted)
+                    # opening the corrupted log fails in both open modes
+                    with self.assertRaises(WalCorruptionError):
+                        WalStore(self.path)
+                    with self.assertRaises(WalCorruptionError):
+                        WalStore(self.path, integrity=True)
+                    self.assertEqual(self.path.read_bytes(), corrupted)
+                    # an instance opened before the corruption reports
+                    # WalCorruptionError from every entry, with memory and
+                    # file bytes untouched and no partial result
+                    self.path.write_bytes(base)
+                    s = WalStore(self.path)
+                    self.path.write_bytes(corrupted)
+                    entries = [
+                        lambda: s.recover(),
+                        lambda: s.get("b"),
+                        lambda: s.contains("b"),
+                        lambda: s.key_version("b"),
+                        lambda: s.scan(),
+                        lambda: s.snapshot(),
+                        lambda: s.snapshot(1),
+                        lambda: s.history(),
+                        lambda: s.diff(0, 2),
+                        lambda: s.pending_changes(),
+                        lambda: s.audit(),
+                        lambda: s.set("q", 1),
+                        lambda: s.delete("b"),
+                        lambda: s.commit(),
+                        lambda: s.rollback(),
+                        lambda: s.restore(1),
+                        lambda: s.apply_batch(2, []),
+                        lambda: s.set_if_version("b", 2, 1),
+                        lambda: s.delete_if_version("b", 2),
+                        lambda: s.apply_if_versions({}, []),
+                        lambda: s.repair_tail(),
+                    ]
+                    for call in entries:
+                        with self.assertRaises(WalCorruptionError):
+                            call()
+                    self.assertEqual(
+                        (s.state, s.commit_seq),
+                        (self.BASE_STATE, self.BASE_SEQ),
+                    )
+                    self.assertEqual(self.path.read_bytes(), corrupted)
+                    # nothing was partially adopted: once the log is
+                    # repaired the same instance recovers the exact
+                    # pre-corruption view
+                    self.path.write_bytes(base)
+                    r = s.recover()
+                    self.assertEqual(
+                        (r["state"], r["commit_seq"], r["pending_count"]),
+                        (self.BASE_STATE, self.BASE_SEQ, 0),
+                    )
+                    s.close()
+
+    # ----- exception kinds and priorities on crashed logs ------------------
+
+    def test_uncommitted_batch_raises_pending_and_preserves_log(self):
+        base = self.make_base(self.path, "legacy")
+        s = WalStore(self.path)
+        s.set("x", 9)
+        s.delete("c")
+        before = self.path.read_bytes()
+        blocked = [
+            lambda: s.restore(1),
+            lambda: s.apply_batch(2, [{"op": "set", "key": "y", "value": 1}]),
+            lambda: s.apply_if_versions(
+                {"x": 0}, [{"op": "set", "key": "x", "value": 2}]
+            ),
+            lambda: s.set_if_version("c", 2, 5),
+            lambda: s.delete_if_version("c", 2),
+        ]
+        for call in blocked:
+            with self.assertRaises(WalPendingError):
+                call()
+        # a stale precondition is not even reached while the log is
+        # unsettled: WalPendingError wins over WalConflictError
+        with self.assertRaises(WalPendingError):
+            s.apply_batch(99, [])
+        with self.assertRaises(WalPendingError):
+            s.set_if_version("c", 99, 5)
+        # none of the rejections wrote, truncated, or changed memory
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), (self.BASE_STATE, 2))
+        # the pending batch is still exactly the two complete records
+        pc = s.pending_changes()
+        self.assertEqual(
+            pc["changes"],
+            [
+                {"op": "set", "key": "x", "value": 9},
+                {"op": "delete", "key": "c"},
+            ],
+        )
+        # rollback clears them at the committed boundary ...
+        self.assertEqual(s.rollback(), 2)
+        self.assertEqual(self.path.read_bytes(), base)
+        # ... and the batch entries accept the very next seq
+        self.assertEqual(
+            s.apply_batch(2, [{"op": "set", "key": "y", "value": 1}]), 3
+        )
+        self.assertEqual(s.state["y"], 1)
+        s.close()
+
+    def test_tail_fragment_alone_raises_pending_on_batch_entries(self):
+        self.make_base(self.path, "protected")
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(self.FRAGMENT)
+        crashed = self.path.read_bytes()
+        s = WalStore(self.path, integrity=True)
+        for call in (
+            lambda: s.restore(1),
+            lambda: s.apply_batch(2, []),
+            lambda: s.apply_if_versions({}, []),
+            lambda: s.set_if_version("c", 2, 5),
+            lambda: s.delete_if_version("c", 2),
+        ):
+            with self.assertRaises(WalPendingError):
+                call()
+        self.assertEqual(self.path.read_bytes(), crashed)
+        # a plain append drops the fragment and the seq chain continues
+        s.set("y", 1)
+        self.assertEqual(s.commit(), 3)
+        self.assertEqual(s.audit()["tail_bytes"], 0)
+        s.close()
+
+    def test_version_conflicts_on_settled_crashed_log(self):
+        self.make_base(self.path, "legacy")
+        before = self.path.read_bytes()
+        s = WalStore(self.path)
+        conflicts = [
+            lambda: s.apply_batch(1, [{"op": "set", "key": "y", "value": 1}]),
+            lambda: s.apply_batch(3, [{"op": "set", "key": "y", "value": 1}]),
+            lambda: s.set_if_version("c", 1, 5),
+            lambda: s.delete_if_version("c", 0),
+            lambda: s.apply_if_versions(
+                {"c": 1}, [{"op": "delete", "key": "c"}]
+            ),
+            lambda: s.apply_if_versions(
+                {"x": 1}, [{"op": "set", "key": "x", "value": 1}]
+            ),
+        ]
+        for call in conflicts:
+            with self.assertRaises(app.WalConflictError):
+                call()
+        # no rejection appended, truncated, or consumed a seq
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), (self.BASE_STATE, 2))
+        # the correct preconditions still go through, seq chain unbroken
+        self.assertEqual(s.apply_batch(2, []), 3)  # empty commit
+        self.assertEqual(s.set_if_version("c", 2, 5), 4)
+        self.assertEqual(s.delete_if_version("c", 4), 5)
+        self.assertEqual(s.state, {"b": {"n": [1, 2]}})
+        s.close()
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"b": {"n": [1, 2]}}, 5))
+        s2.close()
+
+    def test_error_priority_closed_readonly_arguments_corruption(self):
+        base = self.make_base(self.path, "legacy")
+        # closed beats everything, including a corrupted log
+        s = WalStore(self.path)
+        s.close()
+        s.close()  # idempotent
+        self.path.write_bytes(base + b"\xff")
+        closed_calls = [
+            lambda: s.recover(),
+            lambda: s.get("b"),
+            lambda: s.contains("b"),
+            lambda: s.key_version("b"),
+            lambda: s.scan(),
+            lambda: s.snapshot(),
+            lambda: s.history(),
+            lambda: s.diff(0, 2),
+            lambda: s.pending_changes(),
+            lambda: s.audit(),
+            lambda: s.set("q", 1),
+            lambda: s.delete("b"),
+            lambda: s.commit(),
+            lambda: s.rollback(),
+            lambda: s.restore(1),
+            lambda: s.apply_batch(2, []),
+            lambda: s.set_if_version("c", 2, 1),
+            lambda: s.delete_if_version("c", 2),
+            lambda: s.apply_if_versions({}, []),
+            lambda: s.repair_tail(),
+        ]
+        for call in closed_calls:
+            with self.assertRaises(app.WalClosedError):
+                call()
+        # readonly beats argument validation and never touches the log
+        self.path.write_bytes(base)
+        ro = WalStore(self.path, readonly=True)
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.set(123, 1)  # invalid key type, readonly checked first
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.apply_batch(-1, [])
+        ro.close()
+        # a closed readonly instance reports WalClosedError
+        with self.assertRaises(app.WalClosedError):
+            ro.set("q", 1)
+        # argument errors are raised before the log is ever read
+        s2 = WalStore(self.path)
+        self.path.write_bytes(base + b"\xff")
+        with self.assertRaises(ValueError):
+            s2.apply_batch(-1, [])
+        with self.assertRaises(ValueError):
+            s2.set_if_version("c", -1, 1)
+        with self.assertRaises(ValueError):
+            s2.apply_if_versions({"c": "x"}, [])
+        with self.assertRaises(ValueError):
+            s2.snapshot(-1)
+        with self.assertRaises(ValueError):
+            s2.diff(2, 1)
+        # with valid arguments the corruption is reported before any
+        # pending or conflict condition
+        with self.assertRaises(WalCorruptionError):
+            s2.apply_batch(99, [])
+        with self.assertRaises(WalCorruptionError):
+            s2.restore(1)
+        s2.close()
+
+    def test_readonly_queries_survive_crash_but_never_mutate(self):
+        self.make_base(self.path, "legacy")
+        s = WalStore(self.path)
+        s.set("x", 9)  # complete uncommitted record
+        s.close()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(self.FRAGMENT)
+        crashed = self.path.read_bytes()
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(ro.recover()["pending_count"], 1)
+        self.assertEqual(
+            ro.audit()["tail_bytes"], len(self.FRAGMENT.encode("utf-8"))
+        )
+        self.assertEqual(
+            ro.pending_changes()["changes"],
+            [{"op": "set", "key": "x", "value": 9}],
+        )
+        self.assertEqual(ro.scan(), [
+            {"key": "b", "value": {"n": [1, 2]}},
+            {"key": "c", "value": [True, None]},
+        ])
+        mutating = [
+            lambda: ro.set("y", 1),
+            lambda: ro.delete("b"),
+            lambda: ro.commit(),
+            lambda: ro.rollback(),
+            lambda: ro.restore(1),
+            lambda: ro.apply_batch(2, []),
+            lambda: ro.set_if_version("c", 2, 1),
+            lambda: ro.delete_if_version("c", 2),
+            lambda: ro.apply_if_versions({}, []),
+            lambda: ro.repair_tail(),
+        ]
+        for call in mutating:
+            with self.assertRaises(app.WalReadOnlyError):
+                call()
+        self.assertEqual(self.path.read_bytes(), crashed)
+        ro.close()
+
+    # ----- integrity mode, lease, and format preservation ------------------
+
+    def test_integrity_open_rules_on_crashed_logs(self):
+        # a legacy log, even with a crash fragment, refuses integrity=True
+        self.make_base(self.path, "legacy")
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(self.FRAGMENT)
+        crashed = self.path.read_bytes()
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True)
+        # the refusal neither created, truncated, nor appended anything
+        self.assertEqual(self.path.read_bytes(), crashed)
+        # the default mode still recovers the legacy log
+        s = WalStore(self.path)
+        self.assertEqual((s.state, s.commit_seq), (self.BASE_STATE, 2))
+        s.close()
+        # a missing log opened with integrity=True starts a protected chain
+        p2 = Path(self.dir.name) / "fresh.wal"
+        si = WalStore(p2, integrity=True)
+        si.set("a", 1)
+        self.assertEqual(si.commit(), 1)
+        si.close()
+        self.assertIn(b'"ic"', p2.read_bytes())
+        # a protected log with a crash fragment reopens under integrity=True
+        p3 = Path(self.dir.name) / "prot.wal"
+        self.make_base(p3, "protected")
+        with p3.open("a", encoding="utf-8") as f:
+            f.write(self.FRAGMENT)
+        sp = WalStore(p3, integrity=True)
+        r = sp.recover()
+        self.assertEqual((r["commit_seq"], r["pending_count"]), (2, 0))
+        sp.set("y", 2)
+        self.assertEqual(sp.commit(), 3)
+        sp.close()
+        rows = [json.loads(line) for line in p3.read_text().splitlines()]
+        self.assertTrue(all("ic" in row for row in rows))
+
+    def test_exclusive_lease_across_crash_reopen(self):
+        base = self.make_base(self.path, "legacy")
+        s = WalStore(self.path)
+        s.set("x", 9)  # complete uncommitted record
+        s.close()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(self.FRAGMENT)
+        crashed = self.path.read_bytes()
+        s1 = WalStore(self.path, exclusive=True)
+        with self.assertRaises(app.WalBusyError):
+            WalStore(self.path, exclusive=True)
+        # a readonly instance coexists with the live lease
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(ro.recover()["pending_count"], 1)
+        ro.close()
+        self.assertEqual(self.path.read_bytes(), crashed)
+        # the lease holder recovers the crashed log and rolls it back
+        self.assertEqual((s1.state, s1.commit_seq), (self.BASE_STATE, 2))
+        self.assertEqual(s1.rollback(), 1)
+        self.assertEqual(self.path.read_bytes(), base)
+        s1.close()
+        s1.close()  # idempotent
+        # the lease is released: a fresh exclusive instance opens and the
+        # seq chain continues
+        s2 = WalStore(self.path, exclusive=True)
+        self.assertEqual(s2.commit_seq, 2)
+        self.assertEqual(s2.commit(), 3)
+        s2.close()
+        self.assertEqual(WalStore(self.path).commit_seq, 3)
 
 
 if __name__ == "__main__":
