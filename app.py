@@ -39,17 +39,19 @@ class WalReadOnlyError(Exception):
 
 
 class WalPendingError(Exception):
-    """Raised by restore()/apply_batch()/apply_if_versions() when the log is not settled.
+    """Raised by restore()/apply_batch()/apply_if_versions()/commit_if_seq() when the log is not settled.
 
     Either complete, terminated set/delete records wait in an uncommitted
     batch, or an interrupted write leaves an unfinished tail fragment.
     Neither entry splices a new batch into either state; the caller must
     commit or roll the pending records back (or repair the fragment) first.
+    commit_if_seq() is the exception that seals complete pending records
+    instead of refusing them; it raises only for the unfinished fragment.
     """
 
 
 class WalConflictError(Exception):
-    """Raised by apply_batch()/apply_if_versions() when a declared precondition is stale.
+    """Raised by apply_batch()/apply_if_versions()/commit_if_seq() when a declared precondition is stale.
 
     The caller-declared base commit seq or per-key expected version does
     not match the log's latest committed state, so the batch's
@@ -872,6 +874,88 @@ class WalStore:
         # are adopted only once the record is durable: a failed validation or
         # write must neither consume a seq nor present a committed state.
         self._check_writable()
+        self._append({"op": "commit"})
+        self.recover()
+        return self.commit_seq
+
+    def commit_if_seq(self, expected_seq):
+        """Atomically seal the pending batch, guarded by the latest commit seq.
+
+        The conditional counterpart of commit(): the caller declares with
+        ``expected_seq`` the latest committed seq it observed before
+        deciding to seal, and the pending batch is committed only when the
+        log's latest committed seq still equals it. On success one commit
+        record -- seq = latest committed seq + 1 -- is appended, sealing
+        every complete, terminated set/delete record written after the
+        last commit in its original log order, exactly as if commit() had
+        been called; with no pending records the call is an empty commit
+        (one commit record, seq advancing by one). Returns the new
+        commit_seq; state, recover, snapshot, history, diff, scan,
+        pending_changes, key_version, and a reopen then all reflect the
+        same committed result.
+
+        ``expected_seq`` must be a non-boolean non-negative integer; every
+        argument error raises ValueError before the log is read or
+        created. A closed instance raises WalClosedError and a read-only
+        one WalReadOnlyError before any argument is checked, exactly as
+        the other mutating entries do.
+
+        The log is then validated under the exact recover rules (any
+        corruption -- illegal UTF-8, non-standard JSON, duplicate fields,
+        bad field sets, a seq break -- raises WalCorruptionError). A
+        recover/audit-recognisable unfinished tail fragment raises
+        WalPendingError and must be cleared with repair_tail first; the
+        file, the in-memory state, every seq, and the complete pending
+        records all stay untouched. Complete pending records themselves
+        are exactly what this entry seals, so they never raise. A latest
+        committed seq that no longer equals ``expected_seq`` raises
+        WalConflictError, the comparison always made against the latest
+        complete commit. None of these rejections writes, truncates, or
+        consumes a seq.
+
+        The write phase follows the same single-writer lease, per-record
+        flush+fsync, and seq monotonicity rules as commit(): an OSError
+        from the commit record's write or sync propagates unchanged, the
+        already-durable set/delete records stay observable through
+        pending_changes and removable through rollback, neither the
+        in-memory state nor commit_seq advances, and a process terminated
+        at any write boundary recovers to the last complete commit on
+        reopen with no seq skipped. A successful call never rewrites old
+        log bytes.
+        """
+        self._check_writable()
+        _validate_expected_seq(expected_seq)
+        # Full recover-rule validation of the log, purely into local
+        # objects: corruption raises WalCorruptionError before anything is
+        # written, truncated, or adopted.
+        (
+            _candidate,
+            committed,
+            _pending_count,
+            _valid_size,
+            _committed_size,
+        ) = self._replay()
+        # An unfinished tail fragment must be repaired first: appending
+        # over it would silently discard bytes the caller may still owe a
+        # decision on. Complete pending records are not an error here --
+        # sealing them is the whole point of this entry.
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if file_size > self._valid_size:
+            raise WalPendingError(
+                "log has an unfinished tail fragment at commit %r: "
+                "repair_tail() must clear it before the batch can be sealed"
+                % (committed,)
+            )
+        if committed != expected_seq:
+            raise WalConflictError(
+                "expected_seq %r does not match latest committed seq %r"
+                % (expected_seq, committed)
+            )
+        # Append the sealing commit, stamped from a fresh head-to-tail
+        # replay inside _append; the pending records already carry the new
+        # seq, so the commit seals them in order. Adopt the new committed
+        # view only once the boundary is durable, exactly as commit()
+        # does.
         self._append({"op": "commit"})
         self.recover()
         return self.commit_seq

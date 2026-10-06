@@ -6079,6 +6079,268 @@ class ApplyIfVersionsTest(unittest.TestCase):
         self.assertTrue(all("ic" in row for row in rows))
 
 
+class CommitIfSeqTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()  # 1
+        s.set("b", 2)
+        s.commit()  # 2
+        return s
+
+    def test_seals_pending_batch_and_all_views_agree(self):
+        s = self.build()
+        s.set("c", {"n": [1, True]})
+        s.delete("a")
+        self.assertEqual(s.recover()["pending_count"], 2)
+        new_seq = s.commit_if_seq(2)
+        self.assertEqual(new_seq, 3)
+        expected_state = {"b": 2, "c": {"n": [1, True]}}
+        self.assertEqual((s.state, s.commit_seq), (expected_state, 3))
+        self.assertEqual(s.recover()["state"], expected_state)
+        self.assertEqual(s.recover()["pending_count"], 0)
+        self.assertEqual(s.snapshot()["state"], expected_state)
+        self.assertEqual(s.snapshot(2)["state"], {"a": 1, "b": 2})
+        self.assertEqual(
+            s.history()[-1],
+            {"commit_seq": 3,
+             "changes": [{"op": "set", "key": "c", "value": {"n": [1, True]}},
+                         {"op": "delete", "key": "a"}]},
+        )
+        self.assertEqual(
+            s.diff(2, 3)["changes"],
+            [{"op": "delete", "key": "a"},
+             {"op": "set", "key": "c", "value": {"n": [1, True]}}],
+        )
+        self.assertEqual(
+            s.scan(),
+            [{"key": "b", "value": 2},
+             {"key": "c", "value": {"n": [1, True]}}],
+        )
+        self.assertEqual(s.pending_changes()["changes"], [])
+        self.assertEqual(s.key_version("a"), 3)
+        self.assertEqual(s.key_version("c"), 3)
+        self.assertEqual(s.key_version("b"), 2)
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), (expected_state, 3))
+        self.assertEqual(s2.key_version("c"), 3)
+
+    def test_empty_commit_when_nothing_pending(self):
+        s = self.build()
+        self.assertEqual(s.recover()["pending_count"], 0)
+        self.assertEqual(s.commit_if_seq(2), 3)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 3))
+        self.assertEqual(s.history()[-1], {"commit_seq": 3, "changes": []})
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 3))
+
+    def test_empty_log_seals_from_seq_zero(self):
+        s = WalStore(self.path)
+        self.assertFalse(self.path.exists())
+        s.set("a", 1)
+        self.assertEqual(s.commit_if_seq(0), 1)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+
+    def test_log_bytes_match_manual_commit(self):
+        s1 = WalStore(self.path)
+        s1.set("k", 1)
+        s1.commit()
+        s1.set("x", {"n": [1]})
+        s1.delete("k")
+        self.assertEqual(s1.commit_if_seq(1), 2)
+
+        other = Path(self.dir.name) / "manual.wal"
+        s2 = WalStore(other)
+        s2.set("k", 1)
+        s2.commit()
+        s2.set("x", {"n": [1]})
+        s2.delete("k")
+        s2.commit()
+        self.assertEqual(self.path.read_bytes(), other.read_bytes())
+
+    def test_conflict_raises_and_touches_nothing(self):
+        s = self.build()
+        s.set("c", 3)  # complete but uncommitted
+        before = self.path.read_bytes()
+        for bad in (0, 1, 3, 99):
+            with self.assertRaises(app.WalConflictError, msg=bad):
+                s.commit_if_seq(bad)
+        # nothing written, truncated, or consumed; the pending record stays
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        pending = s.pending_changes()
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertEqual(
+            pending["changes"], [{"op": "set", "key": "c", "value": 3}]
+        )
+        # the right seq still seals the same pending batch afterwards
+        self.assertEqual(s.commit_if_seq(2), 3)
+        self.assertEqual(s.state, {"a": 1, "b": 2, "c": 3})
+
+    def test_conflict_is_judged_against_the_latest_commit(self):
+        s1 = self.build()
+        s1.set("c", 3)
+        # a second writer commits out of band while s1 stays open
+        s2 = WalStore(self.path)
+        s2.set("d", 4)
+        s2.commit()  # 3
+        with self.assertRaises(app.WalConflictError):
+            s1.commit_if_seq(2)
+        # s1's pending record is still there, now sealed at the new base
+        self.assertEqual(s1.commit_if_seq(3), 4)
+        self.assertEqual(
+            WalStore(self.path).state, {"a": 1, "b": 2, "c": 3, "d": 4}
+        )
+
+    def test_tail_fragment_raises_walpendingerror(self):
+        s = self.build()
+        s.set("c", 3)
+        s.close()
+        self.append_bytes('{"op": "set", "key": "d", "value": 4, "seq": 3')
+        s2 = WalStore(self.path)
+        before = self.path.read_bytes()
+        with self.assertRaises(WalPendingError):
+            s2.commit_if_seq(2)
+        # the fragment is neither truncated nor appended over, and the
+        # complete pending record survives untouched
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+        self.assertEqual(s2.pending_changes()["pending_count"], 1)
+        s2.repair_tail()
+        self.assertEqual(s2.commit_if_seq(2), 3)
+        self.assertEqual(s2.state, {"a": 1, "b": 2, "c": 3})
+
+    def test_corruption_raises_walcorruptionerror(self):
+        bad_tails = (
+            b'\xff\xfe\n',                                  # illegal UTF-8
+            '{"op": "set", "key": "x", "value": NaN, "seq": 3}\n',
+            '{"op": "set", "key": "x", "key": "y", "value": 1, "seq": 3}\n',
+            '{"op": "set", "key": "x", "seq": 3}\n',        # missing field
+            '{"op": "set", "key": "x", "value": 1, "seq": 9}\n',  # seq break
+        )
+        for tail in bad_tails:
+            with self.subTest(tail=tail):
+                self.write_lines(
+                    {"op": "set", "key": "a", "value": 1, "seq": 1},
+                    {"op": "commit", "seq": 1},
+                )
+                s = WalStore(self.path)
+                self.append_bytes(tail)
+                before = self.path.read_bytes()
+                with self.assertRaises(WalCorruptionError):
+                    s.commit_if_seq(1)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+
+    def test_invalid_expected_seq_raises_valueerror_without_touching_anything(self):
+        s = self.build()
+        before = self.path.read_bytes()
+        for bad in (True, False, -1, -10**9, 1.0, 1.5, "2", b"2", [2],
+                    None, {"s": 2}, object()):
+            with self.assertRaises(ValueError, msg=bad):
+                s.commit_if_seq(bad)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        self.assertEqual(s.recover()["pending_count"], 0)
+
+    def test_invalid_expected_seq_never_creates_the_log(self):
+        s = WalStore(self.path)
+        for bad in (True, -1, 0.0, "0"):
+            with self.assertRaises(ValueError, msg=bad):
+                s.commit_if_seq(bad)
+        self.assertFalse(self.path.exists())
+
+    def test_closed_and_readonly_priorities(self):
+        s = self.build()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.commit_if_seq(2)
+        ro = WalStore(self.path, readonly=True)
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.commit_if_seq(2)
+        # read-only refusal wins over argument validation
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.commit_if_seq("bad")
+        ro.close()
+        with self.assertRaises(app.WalClosedError):
+            ro.commit_if_seq(2)
+
+    def test_oserror_on_commit_leaves_rollbackable_pending_tail(self):
+        s = self.build()
+        s.set("c", 3)
+        before_pending = s.pending_changes()["changes"]
+        with mock.patch("app.os.fsync",
+                        side_effect=OSError("disk on fire")):
+            with self.assertRaises(OSError):
+                s.commit_if_seq(2)
+        # the old committed view is still in place
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        # the durable but unsealed set record is observable and removable
+        pending = s.pending_changes()
+        self.assertEqual(pending["pending_count"], 1)
+        self.assertEqual(pending["changes"], before_pending)
+        self.assertEqual(s.rollback(), 1)
+        self.assertEqual(s.pending_changes()["pending_count"], 0)
+        # a process terminated at that boundary recovers the prior commit
+        s2 = WalStore(self.path)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+        # the transient failure neither consumed a seq nor blocked a retry
+        s2.set("c", 3)
+        self.assertEqual(s2.commit_if_seq(2), 3)
+        self.assertEqual(s2.state["c"], 3)
+
+    def test_seq_stays_monotonic_across_reopens(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        self.assertEqual(s.commit_if_seq(0), 1)
+        s2 = WalStore(self.path)
+        s2.set("b", 2)
+        self.assertEqual(s2.commit_if_seq(1), 2)
+        s3 = WalStore(self.path)
+        self.assertEqual(s3.commit_if_seq(2), 3)  # empty commit
+        s4 = WalStore(self.path)
+        self.assertEqual((s4.state, s4.commit_seq), ({"a": 1, "b": 2}, 3))
+        self.assertEqual([e["commit_seq"] for e in s4.history()], [1, 2, 3])
+
+    def test_exclusive_and_integrity_modes_keep_working(self):
+        s = WalStore(self.path, exclusive=True, integrity=True)
+        s.set("a", 1)
+        self.assertEqual(s.commit_if_seq(0), 1)
+        s.set("b", 2)
+        with self.assertRaises(app.WalConflictError):
+            s.commit_if_seq(0)
+        self.assertEqual(s.commit_if_seq(1), 2)
+        s.close()
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2}, 2))
+        rows = [
+            json.loads(line)
+            for line in self.path.read_text().splitlines()
+        ]
+        self.assertTrue(all("ic" in row for row in rows))
+
+
 # ---------------------------------------------------------------------------
 # Crash-consistency acceptance suite.
 #
@@ -6175,6 +6437,9 @@ elif op == "delete":
 elif op == "commit":
     store.set("p", 9)
     store.commit()
+elif op == "commit_if_seq":
+    store.set("p", 9)
+    store.commit_if_seq(spec["expected"])
 elif op == "restore":
     store.restore(spec["target"])
 elif op == "apply_batch":
@@ -6265,6 +6530,15 @@ class _CrashTestBase(unittest.TestCase):
                 ],
                 {**state0, "p": 9},
             )
+        if op == "commit_if_seq":
+            return (
+                {"op": "commit_if_seq", "expected": seq0},
+                [
+                    ("change", {"op": "set", "key": "p", "value": 9}),
+                    ("commit", None),
+                ],
+                {**state0, "p": 9},
+            )
         if op == "restore":
             if setup == "empty":
                 return ({"op": "restore", "target": 0}, [("commit", None)], {})
@@ -6333,6 +6607,9 @@ class _CrashTestBase(unittest.TestCase):
         elif op == "commit":
             store.set("p", 9)
             store.commit()
+        elif op == "commit_if_seq":
+            store.set("p", 9)
+            store.commit_if_seq(spec["expected"])
         elif op == "restore":
             store.restore(spec["target"])
         elif op == "apply_batch":
@@ -6409,6 +6686,7 @@ class CrashBoundaryTest(_CrashTestBase):
         "set",
         "delete",
         "commit",
+        "commit_if_seq",
         "restore",
         "apply_batch",
         "set_if_version",
@@ -6625,7 +6903,7 @@ class CrashBoundaryTest(_CrashTestBase):
             self.assertEqual((s2.state, s2.commit_seq), (final, seq0 + 2))
             s2.close()
             return
-        if spec["op"] == "commit" and k == len(records) - 1:
+        if spec["op"] in ("commit", "commit_if_seq") and k == len(records) - 1:
             # Only the sealing commit was lost: committing after the reopen
             # seals the same batch with the same seq, producing exactly the
             # crash-free run's bytes.
@@ -6690,6 +6968,9 @@ class CrashBoundaryTest(_CrashTestBase):
 
     def test_commit_crash_boundaries(self):
         self._check_op_crash_boundaries("commit")
+
+    def test_commit_if_seq_crash_boundaries(self):
+        self._check_op_crash_boundaries("commit_if_seq")
 
     def test_restore_crash_boundaries(self):
         self._check_op_crash_boundaries("restore")
@@ -6952,6 +7233,7 @@ class CrashCorruptionStabilityTest(_CrashTestBase):
                         lambda: s.set("q", 1),
                         lambda: s.delete("a"),
                         lambda: s.commit(),
+                        lambda: s.commit_if_seq(seq0),
                         lambda: s.rollback(),
                         lambda: s.restore(1),
                         lambda: s.apply_batch(seq0, []),
@@ -7021,6 +7303,8 @@ class CrashExceptionPriorityTest(_CrashTestBase):
             lambda: s.set_if_version("a", 7, 9),
             lambda: s.delete_if_version("a", 0),
             lambda: s.apply_if_versions({"a": 0}, [{"op": "delete", "key": "a"}]),
+            lambda: s.commit_if_seq(0),
+            lambda: s.commit_if_seq(2),
         ]
         for call in conflicting:
             with self.assertRaises(app.WalConflictError):
@@ -7043,6 +7327,7 @@ class CrashExceptionPriorityTest(_CrashTestBase):
             lambda: ro.set("q", 1),
             lambda: ro.delete("a"),
             lambda: ro.commit(),
+            lambda: ro.commit_if_seq(1),
             lambda: ro.rollback(),
             lambda: ro.restore(1),
             lambda: ro.apply_batch(1, []),
