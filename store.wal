@@ -2,3 +2,5 @@
 {"op": "commit", "seq": 1}
 {"key": "account", "op": "set", "seq": 2, "value": 100}
 {"op": "commit", "seq": 2}
+{"key": "account", "op": "set", "seq": 3, "value": 100}
+{"op": "commit", "seq": 3}
