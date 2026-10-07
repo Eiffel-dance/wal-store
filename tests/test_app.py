@@ -6341,6 +6341,403 @@ class CommitIfSeqTest(unittest.TestCase):
         self.assertTrue(all("ic" in row for row in rows))
 
 
+class ApplyIdempotentTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()  # 1: {a:1}
+        s.set("b", 2)
+        s.commit()  # 2: {a:1, b:2}
+        return s
+
+    def test_first_use_commits_like_apply_batch(self):
+        changes = [
+            {"op": "set", "key": "c", "value": {"n": [1, True]}},
+            {"op": "delete", "key": "a"},
+        ]
+        s = self.build()
+        new_seq = s.apply_idempotent("req-1", 2, changes)
+        self.assertEqual(new_seq, 3)
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.state, {"b": 2, "c": {"n": [1, True]}})
+        self.assertEqual(s.recover()["pending_count"], 0)
+        # the commit record carries the request identifier
+        last_line = self.path.read_bytes().splitlines()[-1]
+        self.assertEqual(
+            json.loads(last_line),
+            {"op": "commit", "request_id": "req-1", "seq": 3},
+        )
+        # every committed view matches the equivalent apply_batch run
+        other = Path(self.dir.name) / "batch.wal"
+        b = WalStore(other)
+        b.set("a", 1)
+        b.commit()
+        b.set("b", 2)
+        b.commit()
+        self.assertEqual(b.apply_batch(2, changes), 3)
+        self.assertEqual(s.state, b.state)
+        self.assertEqual(s.history(), b.history())
+        self.assertEqual(s.snapshot(), b.snapshot())
+        # reopening recovers exactly the batch's committed view
+        s2 = WalStore(self.path)
+        self.assertEqual(
+            (s2.state, s2.commit_seq), ({"b": 2, "c": {"n": [1, True]}}, 3)
+        )
+        self.assertEqual(s2.history(), b.history())
+
+    def test_retry_returns_original_seq_without_writing(self):
+        changes = [{"op": "set", "key": "c", "value": 3}]
+        s = self.build()
+        self.assertEqual(s.apply_idempotent("req-1", 2, changes), 3)
+        bytes_after = self.path.read_bytes()
+        # an exact retry appends nothing, changes nothing, consumes no seq
+        self.assertEqual(s.apply_idempotent("req-1", 2, changes), 3)
+        self.assertEqual(self.path.read_bytes(), bytes_after)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2, "c": 3}, 3))
+        # later commits land; the retry still returns the original seq
+        self.assertEqual(s.apply_batch(3, [{"op": "set", "key": "d", "value": 4}]), 4)
+        self.assertEqual(s.apply_idempotent("req-1", 2, changes), 3)
+        self.assertEqual(s.commit_seq, 4)
+        self.assertEqual(s.state, {"a": 1, "b": 2, "c": 3, "d": 4})
+        # a different identifier is a fresh request, not a retry
+        self.assertEqual(s.apply_idempotent("req-2", 4, changes), 5)
+        self.assertEqual(s.commit_seq, 5)
+
+    def test_retry_survives_reopen(self):
+        changes = [
+            {"op": "set", "key": "c", "value": [1, {"x": None}]},
+            {"op": "delete", "key": "a"},
+        ]
+        s = self.build()
+        self.assertEqual(s.apply_idempotent("req-1", 2, changes), 3)
+        s.close()
+        bytes_after = self.path.read_bytes()
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.apply_idempotent("req-1", 2, changes), 3)
+        self.assertEqual(self.path.read_bytes(), bytes_after)
+        self.assertEqual(s2.commit_seq, 3)
+        s2.close()
+
+    def test_empty_changes_commit_is_idempotent(self):
+        s = self.build()
+        self.assertEqual(s.apply_idempotent("req-empty", 2, []), 3)
+        bytes_after = self.path.read_bytes()
+        self.assertEqual(s.apply_idempotent("req-empty", 2, []), 3)
+        self.assertEqual(self.path.read_bytes(), bytes_after)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 3))
+        self.assertEqual(s.history()[-1], {"commit_seq": 3, "changes": []})
+
+    def test_same_id_different_parameters_conflicts(self):
+        s = self.build()
+        changes = [
+            {"op": "set", "key": "c", "value": 3},
+            {"op": "delete", "key": "a"},
+        ]
+        self.assertEqual(s.apply_idempotent("req-1", 2, changes), 3)
+        bytes_after = self.path.read_bytes()
+        conflicting = [
+            # a different base_seq
+            ("req-1", 1, changes),
+            ("req-1", 3, changes),
+            # a changed value
+            ("req-1", 2, [{"op": "set", "key": "c", "value": 4},
+                          {"op": "delete", "key": "a"}]),
+            # a changed key
+            ("req-1", 2, [{"op": "set", "key": "z", "value": 3},
+                          {"op": "delete", "key": "a"}]),
+            # reordered changes
+            ("req-1", 2, [{"op": "delete", "key": "a"},
+                          {"op": "set", "key": "c", "value": 3}]),
+            # a delete where the set was
+            ("req-1", 2, [{"op": "delete", "key": "c"},
+                          {"op": "delete", "key": "a"}]),
+            # fewer / more changes
+            ("req-1", 2, [{"op": "set", "key": "c", "value": 3}]),
+            ("req-1", 2, changes + [{"op": "set", "key": "e", "value": 5}]),
+        ]
+        for request_id, base_seq, retry_changes in conflicting:
+            with self.subTest(base_seq=base_seq, changes=retry_changes):
+                with self.assertRaises(app.WalConflictError):
+                    s.apply_idempotent(request_id, base_seq, retry_changes)
+        # no rejection wrote, truncated, consumed a seq, or moved state
+        self.assertEqual(self.path.read_bytes(), bytes_after)
+        self.assertEqual(
+            (s.state, s.commit_seq), ({"b": 2, "c": 3}, 3)
+        )
+
+    def test_comparison_distinguishes_json_numbers_and_booleans(self):
+        s = WalStore(self.path)
+        changes = [{"op": "set", "key": "k", "value": {"n": [1, True]}}]
+        self.assertEqual(s.apply_idempotent("req-1", 0, changes), 1)
+        # JSON numbers compare numerically across int/float
+        self.assertEqual(
+            s.apply_idempotent(
+                "req-1", 0, [{"op": "set", "key": "k", "value": {"n": [1.0, True]}}]
+            ),
+            1,
+        )
+        # ...but a boolean is never a number, nested or not
+        with self.assertRaises(app.WalConflictError):
+            s.apply_idempotent(
+                "req-1", 0, [{"op": "set", "key": "k", "value": {"n": [1, 1]}}]
+            )
+        with self.assertRaises(app.WalConflictError):
+            s.apply_idempotent(
+                "req-1", 0, [{"op": "set", "key": "k", "value": {"n": [True, True]}}]
+            )
+        self.assertEqual(s.commit_seq, 1)
+
+    def test_fresh_id_with_stale_base_conflicts(self):
+        s = self.build()
+        before = self.path.read_bytes()
+        with self.assertRaises(app.WalConflictError):
+            s.apply_idempotent("req-1", 1, [])
+        with self.assertRaises(app.WalConflictError):
+            s.apply_idempotent("req-1", 99, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        # the identifier stayed unused: the up-to-date base succeeds
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+
+    def test_argument_validation_precedes_log_access(self):
+        missing = Path(self.dir.name) / "missing.wal"
+        s = WalStore(missing)
+        s.close()  # closed before any argument check
+        with self.assertRaises(app.WalClosedError):
+            s.apply_idempotent("", "not-an-int", "not-a-list")
+        self.assertFalse(missing.exists())
+        s = WalStore(missing, readonly=True)
+        with self.assertRaises(app.WalReadOnlyError):
+            s.apply_idempotent("", "not-an-int", "not-a-list")
+        s.close()
+        self.assertFalse(missing.exists())
+        s = WalStore(missing)
+        bad_request_ids = ["", None, 0, 1, b"x", ["x"], {"x": 1}, True]
+        for request_id in bad_request_ids:
+            with self.subTest(request_id=request_id):
+                with self.assertRaises(ValueError):
+                    s.apply_idempotent(request_id, 0, [])
+        bad_bases = [True, False, -1, "0", 0.5, None]
+        for base in bad_bases:
+            with self.subTest(base=base):
+                with self.assertRaises(ValueError):
+                    s.apply_idempotent("req-1", base, [])
+        bad_changes = [
+            "not-a-list",
+            42,
+            [{"op": "set", "key": "k"}],
+            [{"op": "set", "key": "k", "value": 1, "extra": 2}],
+            [{"op": "delete", "key": "k", "value": 1}],
+            [{"op": "bogus", "key": "k"}],
+            [{"op": "set", "key": 1, "value": 1}],
+            [{"op": "set", "key": "k", "value": float("nan")}],
+            ["not-a-dict"],
+        ]
+        for changes in bad_changes:
+            with self.subTest(changes=changes):
+                with self.assertRaises(ValueError):
+                    s.apply_idempotent("req-1", 0, changes)
+        # every rejection happened before the log was created
+        self.assertFalse(missing.exists())
+        s.close()
+
+    def test_pending_records_block_then_free_the_identifier(self):
+        s = self.build()
+        s.set("c", 3)  # complete but uncommitted record
+        with self.assertRaises(WalPendingError):
+            s.apply_idempotent("req-1", 2, [{"op": "set", "key": "d", "value": 4}])
+        # even an already-used identifier reports the unsettled log first
+        s.rollback()
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+        s.set("c", 3)
+        with self.assertRaises(WalPendingError):
+            s.apply_idempotent("req-1", 2, [])
+        # rolling the pending records back settles the log; the retry then
+        # returns the original seq
+        self.assertEqual(s.rollback(), 1)
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+        self.assertEqual(s.commit_seq, 3)
+
+    def test_unfinished_tail_blocks_until_repaired(self):
+        s = self.build()
+        s.close()
+        with self.path.open("ab") as f:
+            f.write(b'{"op": "set", "key": "c"')  # interrupted write
+        s = WalStore(self.path)
+        with self.assertRaises(WalPendingError):
+            s.apply_idempotent("req-1", 2, [])
+        r = s.repair_tail()
+        self.assertGreater(r["removed_bytes"], 0)
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+        s.close()
+
+    def test_commit_failure_leaves_identifier_unused(self):
+        changes = [{"op": "set", "key": "c", "value": 3}]
+        s = WalStore(self.path)
+        calls = {"n": 0}
+        real_fsync = os.fsync
+
+        def flaky(fd):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                # the change record and the created file's directory entry
+                # are durable; the commit record's sync fails
+                raise OSError("simulated fsync failure")
+            return real_fsync(fd)
+
+        with mock.patch("app.os.fsync", side_effect=flaky):
+            with self.assertRaises(OSError):
+                s.apply_idempotent("req-1", 0, changes)
+        # the commit never became durable: state and seq did not move, the
+        # change record is pending, and the identifier is still free
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        p = s.pending_changes()
+        self.assertEqual(p["changes"], changes)
+        with self.assertRaises(WalPendingError):
+            s.apply_idempotent("req-1", 0, changes)
+        self.assertEqual(s.rollback(), 1)
+        self.assertEqual(s.apply_idempotent("req-1", 0, changes), 1)
+        self.assertEqual(s.state, {"c": 3})
+        # the now-durable identifier answers retries with the original seq
+        self.assertEqual(s.apply_idempotent("req-1", 0, changes), 1)
+        s.close()
+
+    def test_corruption_beats_everything(self):
+        s = self.build()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "bogus", "seq": 3}\n')
+        before = self.path.read_bytes()
+        with self.assertRaises(WalCorruptionError):
+            s.apply_idempotent("req-1", 2, [])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "b": 2}, 2))
+        s.close()
+
+    def test_request_id_stays_out_of_read_views(self):
+        s = WalStore(self.path)
+        self.assertEqual(
+            s.apply_idempotent("req-1", 0, [{"op": "set", "key": "k", "value": 1}]),
+            1,
+        )
+        self.assertEqual(s.history(), [
+            {"commit_seq": 1, "changes": [{"op": "set", "key": "k", "value": 1}]}
+        ])
+        self.assertEqual(s.snapshot(), {"state": {"k": 1}, "commit_seq": 1})
+        self.assertEqual(s.pending_changes()["changes"], [])
+        a = s.audit()
+        self.assertEqual((a["commit_seq"], a["pending_count"]), (1, 0))
+        self.assertEqual(s.scan(), [{"key": "k", "value": 1}])
+        s.close()
+
+    def test_caller_changes_are_deep_copied(self):
+        s = WalStore(self.path)
+        changes = [{"op": "set", "key": "k", "value": {"n": [1]}}]
+        self.assertEqual(s.apply_idempotent("req-1", 0, changes), 1)
+        changes[0]["value"]["n"].append(2)
+        # the stored request still compares against the original values
+        with self.assertRaises(app.WalConflictError):
+            s.apply_idempotent("req-1", 0, changes)
+        self.assertEqual(
+            s.apply_idempotent(
+                "req-1", 0, [{"op": "set", "key": "k", "value": {"n": [1]}}]
+            ),
+            1,
+        )
+        self.assertEqual(s.state, {"k": {"n": [1]}})
+        s.close()
+
+    def test_integrity_protected_log(self):
+        s = WalStore(self.path, integrity=True)
+        changes = [{"op": "set", "key": "k", "value": 1}]
+        self.assertEqual(s.apply_idempotent("req-1", 0, changes), 1)
+        bytes_after = self.path.read_bytes()
+        self.assertEqual(s.apply_idempotent("req-1", 0, changes), 1)
+        self.assertEqual(self.path.read_bytes(), bytes_after)
+        s.close()
+        # the protected chain still verifies on reopen, marker included
+        s2 = WalStore(self.path, integrity=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"k": 1}, 1))
+        self.assertEqual(s2.apply_idempotent("req-1", 0, changes), 1)
+        self.assertEqual(s2.apply_idempotent("req-2", 1, []), 2)
+        s2.close()
+        for line in self.path.read_bytes().splitlines():
+            self.assertIn(b'"ic"', line)
+
+    def test_legacy_and_mixed_logs_keep_working(self):
+        # a legacy log (no request_id markers) accepts idempotent commits
+        s = self.build()
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+        # plain commits may follow idempotent ones in the same log
+        self.assertEqual(s.commit(), 4)
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+        self.assertEqual(s.commit_seq, 4)
+        s.close()
+        s2 = WalStore(self.path)
+        self.assertEqual(s2.commit_seq, 4)
+        self.assertEqual(s2.apply_idempotent("req-1", 2, []), 3)
+        s2.close()
+
+    def test_malformed_request_id_records_are_corruption(self):
+        # a non-string request_id on a commit record
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1, "request_id": 5},
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        # an empty request_id
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1, "request_id": ""},
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        # a request_id on a non-commit record breaks the field set
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1, "request_id": "r"},
+            {"op": "commit", "seq": 1},
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+        # the same request_id committed twice can only be tampering
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1, "request_id": "r"},
+            {"op": "set", "key": "b", "value": 2, "seq": 2},
+            {"op": "commit", "seq": 2, "request_id": "r"},
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path)
+
+    def test_strict_tail_store(self):
+        s = self.build()
+        s.close()
+        s = WalStore(self.path, strict_tail=True)
+        with self.path.open("ab") as f:
+            f.write(b'{"op": "set", "key": "c"')  # out-of-band tail fragment
+        with self.assertRaises(app.WalTailError):
+            s.apply_idempotent("req-1", 2, [])
+        s.repair_tail()
+        self.assertEqual(s.apply_idempotent("req-1", 2, []), 3)
+        s.close()
+
+
 # ---------------------------------------------------------------------------
 # Crash-consistency acceptance suite.
 #
@@ -6444,6 +6841,8 @@ elif op == "restore":
     store.restore(spec["target"])
 elif op == "apply_batch":
     store.apply_batch(spec["base"], spec["changes"])
+elif op == "apply_idempotent":
+    store.apply_idempotent(spec["request_id"], spec["base"], spec["changes"])
 elif op == "set_if_version":
     store.set_if_version("k", spec["expected"], 5)
 elif op == "delete_if_version":
@@ -6561,6 +6960,25 @@ class _CrashTestBase(unittest.TestCase):
                 ],
                 {**without_a, "x": 1},
             )
+        if op == "apply_idempotent":
+            changes = [
+                {"op": "set", "key": "x", "value": 1},
+                {"op": "delete", "key": "a"},
+            ]
+            return (
+                {
+                    "op": "apply_idempotent",
+                    "request_id": "req-crash",
+                    "base": seq0,
+                    "changes": changes,
+                },
+                [
+                    ("change", changes[0]),
+                    ("change", changes[1]),
+                    ("commit", None),
+                ],
+                {**without_a, "x": 1},
+            )
         if op == "set_if_version":
             return (
                 {"op": "set_if_version", "expected": 0},
@@ -6614,6 +7032,10 @@ class _CrashTestBase(unittest.TestCase):
             store.restore(spec["target"])
         elif op == "apply_batch":
             store.apply_batch(spec["base"], spec["changes"])
+        elif op == "apply_idempotent":
+            store.apply_idempotent(
+                spec["request_id"], spec["base"], spec["changes"]
+            )
         elif op == "set_if_version":
             store.set_if_version("k", spec["expected"], 5)
         elif op == "delete_if_version":
@@ -6689,6 +7111,7 @@ class CrashBoundaryTest(_CrashTestBase):
         "commit_if_seq",
         "restore",
         "apply_batch",
+        "apply_idempotent",
         "set_if_version",
         "delete_if_version",
         "apply_if_versions",
@@ -6978,6 +7401,9 @@ class CrashBoundaryTest(_CrashTestBase):
     def test_apply_batch_crash_boundaries(self):
         self._check_op_crash_boundaries("apply_batch")
 
+    def test_apply_idempotent_crash_boundaries(self):
+        self._check_op_crash_boundaries("apply_idempotent")
+
     def test_set_if_version_crash_boundaries(self):
         self._check_op_crash_boundaries("set_if_version")
 
@@ -7237,6 +7663,7 @@ class CrashCorruptionStabilityTest(_CrashTestBase):
                         lambda: s.rollback(),
                         lambda: s.restore(1),
                         lambda: s.apply_batch(seq0, []),
+                        lambda: s.apply_idempotent("rid", seq0, []),
                         lambda: s.set_if_version("a", 1, 2),
                         lambda: s.delete_if_version("a", 1),
                         lambda: s.apply_if_versions({}, []),
@@ -7267,6 +7694,7 @@ class CrashExceptionPriorityTest(_CrashTestBase):
         settled_only = [
             lambda: s.restore(1),
             lambda: s.apply_batch(1, []),
+            lambda: s.apply_idempotent("rid", 1, []),
             lambda: s.apply_if_versions({}, []),
             lambda: s.set_if_version("a", 1, 9),
             lambda: s.delete_if_version("a", 1),
@@ -7277,6 +7705,7 @@ class CrashExceptionPriorityTest(_CrashTestBase):
         # WalPendingError keeps priority over a stale version/base.
         stale = [
             lambda: s.apply_batch(99, []),
+            lambda: s.apply_idempotent("rid", 99, []),
             lambda: s.set_if_version("a", 7, 9),
             lambda: s.delete_if_version("a", 7),
             lambda: s.apply_if_versions({"a": 7}, []),
@@ -7300,6 +7729,7 @@ class CrashExceptionPriorityTest(_CrashTestBase):
         before = self.path.read_bytes()
         conflicting = [
             lambda: s.apply_batch(0, [{"op": "set", "key": "b", "value": 2}]),
+            lambda: s.apply_idempotent("rid", 0, []),
             lambda: s.set_if_version("a", 7, 9),
             lambda: s.delete_if_version("a", 0),
             lambda: s.apply_if_versions({"a": 0}, [{"op": "delete", "key": "a"}]),
@@ -7331,6 +7761,7 @@ class CrashExceptionPriorityTest(_CrashTestBase):
             lambda: ro.rollback(),
             lambda: ro.restore(1),
             lambda: ro.apply_batch(1, []),
+            lambda: ro.apply_idempotent("rid", 1, []),
             lambda: ro.set_if_version("a", 1, 9),
             lambda: ro.delete_if_version("a", 1),
             lambda: ro.apply_if_versions({}, []),
