@@ -428,6 +428,109 @@ def _reject_duplicate_keys(pairs):
 _LOCK_DIR = os.path.join(tempfile.gettempdir(), "walstore_locks")
 
 
+class WalView:
+    """A fixed committed read view pinned to one commit boundary.
+
+    Created by WalStore.view(); never constructed directly with log bytes.
+    The view holds its own private copy of the committed key/value state at
+    the boundary it was created for, so nothing that happens afterwards --
+    new commits on the originating WalStore, closing that store, or later
+    modification or corruption of the log file -- can change or invalidate
+    it. It is purely a read object: it has no write entry point, produces
+    no WAL bytes, pending records, or seqs, and never touches the log, the
+    write lease, or the originating store.
+
+    Attributes:
+        commit_seq: the commit boundary the view is pinned to (0 for the
+            empty state).
+    """
+
+    def __init__(self, state, commit_seq):
+        # ``state`` must already be a deep copy private to this view (the
+        # replay's snapshots are); it is never shared with the store, the
+        # parsed log objects, or any caller.
+        self._state = state
+        self.commit_seq = commit_seq
+
+    @property
+    def state(self):
+        """The complete key/value state at the view's commit boundary.
+
+        An independent deep copy on every access: mutating the returned
+        object never affects the view or any later read.
+        """
+        return copy.deepcopy(self._state)
+
+    def get(self, key, default=_UNSET):
+        # Same key validation, default, and KeyError semantics as
+        # WalStore.get, served from the pinned state instead of the log.
+        _validate_key(key)
+        if default is not _UNSET:
+            _validate_value(default)
+        if key in self._state:
+            # An independent deep copy: mutating a returned nested dict or
+            # list must not affect the view or later reads.
+            return copy.deepcopy(self._state[key])
+        if default is not _UNSET:
+            # A stored None (key in state) and a missing key never collapse:
+            # presence above returns the stored value, even when it is None.
+            return copy.deepcopy(default)
+        raise KeyError(key)
+
+    def contains(self, key):
+        _validate_key(key)
+        return key in self._state
+
+    def scan(self, start_key=None, end_key=None, limit=None):
+        """Deterministic range scan of the view's pinned state.
+
+        Same contract as WalStore.scan -- half-open [start_key, end_key)
+        range, Unicode code point ordering, limit validation and capping --
+        but served entirely from the pinned state: no log is read and the
+        result can never change between calls.
+        """
+        # Reject every argument exactly as WalStore.scan does.
+        if start_key is not None and not isinstance(start_key, str):
+            raise ValueError(
+                "start_key must be a string or omitted, got %r"
+                % (type(start_key).__name__,)
+            )
+        if end_key is not None and not isinstance(end_key, str):
+            raise ValueError(
+                "end_key must be a string or omitted, got %r"
+                % (type(end_key).__name__,)
+            )
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError(
+                "limit must be a non-negative integer or omitted, got %r"
+                % (limit,)
+            )
+        if (
+            start_key is not None
+            and end_key is not None
+            and start_key > end_key
+        ):
+            raise ValueError(
+                "start_key %r exceeds end_key %r" % (start_key, end_key)
+            )
+        # Sort by Unicode code point first, then apply the half-open
+        # [start_key, end_key) window and the limit cap in that order, so
+        # limit always means the first limit ordered matches.
+        keys = sorted(self._state)
+        if start_key is not None:
+            keys = [key for key in keys if key >= start_key]
+        if end_key is not None:
+            keys = [key for key in keys if key < end_key]
+        if limit is not None:
+            keys = keys[:limit]
+        return [
+            {"key": key, "value": copy.deepcopy(self._state[key])}
+            for key in keys
+        ]
+
+
 class WalStore:
     def __init__(
         self, path, exclusive=False, readonly=False, integrity=False,
@@ -1848,6 +1951,86 @@ class WalStore:
             # mutate the result freely without affecting the store.
             state = dict(history)[target_seq]
         return RecoveryResult(state=state, commit_seq=target_seq)
+
+    def view(self, target_seq=None):
+        """Read-only committed view object pinned to one commit boundary.
+
+        The fixed-view counterpart of snapshot(): validates the whole log
+        under the exact recover rules, then returns a WalView holding its
+        own private copy of the committed key/value state at ``target_seq``.
+        Where snapshot() answers once, the returned object keeps serving
+        that boundary -- commit_seq, state, get, contains, and scan --
+        without ever touching the log again: later commits on this store,
+        closing this store, and later modification or corruption of the
+        log file can neither change nor invalidate the view.
+
+        target_seq defaults to the latest committed seq at creation time;
+        0 yields the empty state. When given it must be a non-boolean
+        non-negative integer no greater than the latest committed seq;
+        every other value raises ValueError. A closed instance raises
+        WalClosedError before the log is read. The log is then validated
+        under the exact recover rules, exactly as snapshot does: a missing
+        or empty log yields the empty view at seq 0 (and is never
+        created), any corruption raises WalCorruptionError, an
+        integrity=True store meeting a non-empty unprotected legacy log
+        raises WalIntegrityError, and on a strict-tail store a
+        recover-recognised unfinished tail fragment raises WalTailError.
+        Uncommitted set/delete records and a discardable tail fragment
+        are invisible to the view, exactly as they are to snapshot.
+
+        The creation is purely observational: it never appends, truncates,
+        or rewrites the log, never creates a missing log file, takes no
+        write lease, and never changes state, commit_seq, pending_count,
+        or the cached accepted-prefix boundary, so audit, recover,
+        snapshot, history, diff, scan, pending_changes, and key_version
+        all observe exactly what they would without the call. Repeating
+        the call with the same target_seq on the same log boundary yields
+        a view with identical content, and mutating anything the view
+        hands out never affects the view or later reads.
+        """
+        # Closed takes priority, exactly as every other public query does.
+        self._check_open()
+        # Validate the whole log under the exact recover rules, purely into
+        # local objects, collecting one snapshot per commit boundary. As in
+        # scan and diff, restore the cached accepted-prefix boundary so an
+        # observational view creation can never influence a later append's
+        # decision to drop a tail fragment.
+        history = []
+        saved_valid_size = self._valid_size
+        try:
+            (
+                _candidate,
+                committed,
+                _pending,
+                _valid_size,
+                _committed_size,
+            ) = self._replay(snapshots=history)
+        finally:
+            self._valid_size = saved_valid_size
+        # Same target_seq rules and priority as snapshot: default to the
+        # latest committed seq, then reject non-integer, boolean, negative,
+        # and out-of-range values.
+        if target_seq is None:
+            target_seq = committed
+        elif (
+            isinstance(target_seq, bool)
+            or not isinstance(target_seq, int)
+            or target_seq < 0
+        ):
+            raise ValueError(
+                "target_seq must be a non-negative integer, got %r" % (target_seq,)
+            )
+        if target_seq > committed:
+            raise ValueError(
+                "target_seq %r exceeds latest committed seq %r"
+                % (target_seq, committed)
+            )
+        # Commit seqs are contiguous from 1, so the target's state is
+        # exactly the snapshot recorded at that commit boundary; 0 is the
+        # empty state. The snapshot is already a deep copy private to this
+        # call, so the view can adopt it directly as its pinned state.
+        state = {} if target_seq == 0 else dict(history)[target_seq]
+        return WalView(state, target_seq)
 
     def history(self, since_seq=0, until_seq=None):
         """Read-only export of committed change batches, in commit order.
