@@ -96,6 +96,35 @@ class WalConflictError(Exception):
     """
 
 
+class WalCapacityError(Exception):
+    """Raised when a planned append would exceed the store's max_bytes limit.
+
+    A WalStore opened with ``max_bytes`` refuses -- deterministically,
+    before any record is written -- every call whose complete new records
+    (record bytes plus terminator, measured on the file length after the
+    recover-recognised tail fragment would be discarded) would push the
+    log past the limit. Nothing is appended, the tail fragment is not
+    truncated, and every seq, state, commit_seq, pending_count, and the
+    file bytes stay exactly as they were; uncommitted records already in
+    the log remain observable through pending_changes and can still be
+    sealed with commit, dropped with rollback, or a fragment cleared with
+    repair_tail.
+
+    Attributes:
+        limit: the store's configured max_bytes.
+        required_bytes: the exact file length the call would have
+            produced had it succeeded.
+    """
+
+    def __init__(self, limit, required_bytes):
+        self.limit = limit
+        self.required_bytes = required_bytes
+        super().__init__(
+            "log capacity exceeded: limit=%r, required_bytes=%r"
+            % (limit, required_bytes)
+        )
+
+
 class RecoveryResult(dict):
     """Plain result mapping; keys are also readable as attributes."""
 
@@ -536,7 +565,7 @@ class WalView:
 class WalStore:
     def __init__(
         self, path, exclusive=False, readonly=False, integrity=False,
-        strict_tail=False,
+        strict_tail=False, max_bytes=None,
     ):
         # Validate every parameter before touching the path in any way: a
         # rejected call must never read, create, truncate, or append to the
@@ -563,6 +592,15 @@ class WalStore:
                 "strict_tail must be a bool, got %r"
                 % (type(strict_tail).__name__,)
             )
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes < 0
+        ):
+            raise ValueError(
+                "max_bytes must be a non-negative integer or omitted, got %r"
+                % (max_bytes,)
+            )
         self.path = Path(path)
         self.state = {}
         self.commit_seq = 0
@@ -587,6 +625,14 @@ class WalStore:
         # counts as a valid record, as corruption, or as a fragment -- only
         # whether a recognised fragment is accepted.
         self._strict_tail = strict_tail
+        # Optional persistent log capacity limit. None means unlimited
+        # (the historical default); otherwise every write entry prechecks
+        # the exact post-write file length against it and refuses
+        # over-limit appends with WalCapacityError before a byte is
+        # written. The limit constrains only new appends: opening,
+        # recover, and every read-only query accept an already-over-limit
+        # log, and rollback/repair_tail only ever shrink it.
+        self._max_bytes = max_bytes
         # Legacy per-normalized-path lease descriptor (kept for the exact
         # historical sibling-lock behaviour) plus the real-object identity
         # lease descriptors:
@@ -965,6 +1011,51 @@ class WalStore:
             raise
         return candidate, committed
 
+    def _check_capacity(self, rows):
+        """Refuse a planned append that would exceed the max_bytes limit.
+
+        ``rows`` is the exact ordered sequence of record dicts the calling
+        entry is about to pass to _append (seq stamps and integrity
+        metadata are recomputed here exactly as _append derives them, so a
+        batch is prechecked as a whole). The log is replayed under the
+        exact recover rules purely into local objects -- corruption, a
+        strict-tail fragment, and every other replay rejection keep their
+        usual priority and propagate unchanged -- and the final file
+        length is computed as the accepted prefix (the recover-recognised
+        tail fragment discarded, exactly as the first _append would drop
+        it) plus the complete bytes of every planned record and its
+        terminator. When that length exceeds max_bytes, WalCapacityError
+        is raised before anything is written, truncated, or adopted: the
+        tail fragment, every seq, state, commit_seq, pending_count, and
+        the file bytes stay exactly as they were. With no limit
+        configured the check is a no-op and the log is not even read.
+        """
+        if self._max_bytes is None:
+            return
+        saved_valid_size = self._valid_size
+        saved_chain_head = self._chain_head
+        try:
+            _candidate, committed, _pending, valid_size, _committed_size = (
+                self._replay()
+            )
+            chain_head = self._chain_head
+        finally:
+            self._valid_size = saved_valid_size
+            self._chain_head = saved_chain_head
+        required = valid_size
+        chain = chain_head
+        for row in rows:
+            record = dict(row)
+            record["seq"] = committed + 1
+            if self._protected:
+                core_line = json.dumps(record, sort_keys=True)
+                record[_INTEGRITY_FIELD] = _chain_digest(chain, core_line)
+                chain = record[_INTEGRITY_FIELD]
+            line = json.dumps(record, sort_keys=True) + "\n"
+            required += len(line.encode("utf-8"))
+        if required > self._max_bytes:
+            raise WalCapacityError(self._max_bytes, required)
+
     def _append(self, row):
         """Durably append one log record after head-to-tail revalidation.
 
@@ -1042,14 +1133,20 @@ class WalStore:
         self._check_writable()
         _validate_key(key)
         _validate_value(value)
+        row = {"op": "set", "key": key, "value": value}
+        # Capacity precheck: an over-limit append is refused before the
+        # tail fragment is truncated or any record is written.
+        self._check_capacity([row])
         # The seq is stamped inside _append from a fresh head-to-tail replay,
         # not from the open-time cached commit_seq.
-        self._append({"op": "set", "key": key, "value": value})
+        self._append(row)
 
     def delete(self, key):
         self._check_writable()
         _validate_key(key)
-        self._append({"op": "delete", "key": key})
+        row = {"op": "delete", "key": key}
+        self._check_capacity([row])
+        self._append(row)
 
     def commit(self):
         # Re-validate the whole log and persist the commit boundary first; the
@@ -1057,6 +1154,7 @@ class WalStore:
         # are adopted only once the record is durable: a failed validation or
         # write must neither consume a seq nor present a committed state.
         self._check_writable()
+        self._check_capacity([{"op": "commit"}])
         self._append({"op": "commit"})
         self.recover()
         return self.commit_seq
@@ -1104,7 +1202,10 @@ class WalStore:
         in-memory state nor commit_seq advances, and a process terminated
         at any write boundary recovers to the last complete commit on
         reopen with no seq skipped. A successful call never rewrites old
-        log bytes.
+        log bytes. When the store was opened with max_bytes, the complete
+        commit record is prechecked against the limit after every check
+        above: an over-limit append raises WalCapacityError with nothing
+        written, truncated, or adopted.
         """
         self._check_writable()
         _validate_expected_seq(expected_seq)
@@ -1134,6 +1235,9 @@ class WalStore:
                 "expected_seq %r does not match latest committed seq %r"
                 % (expected_seq, committed)
             )
+        # Capacity precheck: an over-limit commit record is refused before
+        # anything is written, leaving the pending records untouched.
+        self._check_capacity([{"op": "commit"}])
         # Append the sealing commit, stamped from a fresh head-to-tail
         # replay inside _append; the pending records already carry the new
         # seq, so the commit seals them in order. Adopt the new committed
@@ -1198,7 +1302,12 @@ class WalStore:
         Every change record and the commit are appended and fsynced one
         at a time as in set/commit; an OSError propagates with the old
         committed state and seq in place, already-written records simply
-        forming the batch's pending tail (rollback clears them).
+        forming the batch's pending tail (rollback clears them). When the
+        store was opened with max_bytes, the complete record sequence --
+        every change plus the sealing commit -- is prechecked against the
+        limit as one unit after every check above: an over-limit append
+        raises WalCapacityError with nothing written, truncated, or
+        adopted.
         """
         self._check_writable()
         if (
@@ -1241,14 +1350,19 @@ class WalStore:
         # (code point) key order. A key only in the target, or present
         # with a different value under JSON-type-aware comparison, is a
         # set; a key present now but absent in the target is a delete.
+        # The complete record sequence -- every change plus the sealing
+        # commit -- is planned first and prechecked against the capacity
+        # limit as one unit: when it would exceed max_bytes,
+        # WalCapacityError is raised before any record is written.
         new_seq = committed + 1
+        rows = []
         for key in sorted(set(current) | set(target)):
             if key not in target:
-                self._append({"op": "delete", "key": key, "seq": new_seq})
+                rows.append({"op": "delete", "key": key, "seq": new_seq})
             elif key not in current or not _json_equal(current[key], target[key]):
                 # Deep copy: the adopted value must not share objects with
                 # the replay's snapshot, which the caller could mutate.
-                self._append(
+                rows.append(
                     {
                         "op": "set",
                         "key": key,
@@ -1256,7 +1370,10 @@ class WalStore:
                         "seq": new_seq,
                     }
                 )
-        self._append({"op": "commit", "seq": new_seq})
+        rows.append({"op": "commit", "seq": new_seq})
+        self._check_capacity(rows)
+        for row in rows:
+            self._append(row)
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()
@@ -1301,7 +1418,11 @@ class WalStore:
         the unsealed part of the batch is never applied. Values are
         deep-copied into the written records, so neither the caller's
         changes collection nor the returned seq shares mutable nested
-        objects with the store.
+        objects with the store. When the store was opened with max_bytes,
+        the whole batch -- every change record plus the sealing commit --
+        is prechecked against the limit as one unit after every check
+        above: an over-limit append raises WalCapacityError with not a
+        single record written.
         """
         self._check_writable()
         if (
@@ -1352,13 +1473,20 @@ class WalStore:
         # Append each change record and then the sealing commit, one
         # durable record at a time, exactly as restore does. An OSError
         # propagates with the old committed state and seq in place; the
-        # already-written records form the batch's pending tail.
+        # already-written records form the batch's pending tail. The whole
+        # batch is prechecked against the capacity limit as one unit: when
+        # the complete records would exceed max_bytes, WalCapacityError is
+        # raised here and not a single record is written.
         new_seq = committed + 1
+        rows = []
         for change in normalized:
             record = dict(change)
             record["seq"] = new_seq
-            self._append(record)
-        self._append({"op": "commit", "seq": new_seq})
+            rows.append(record)
+        rows.append({"op": "commit", "seq": new_seq})
+        self._check_capacity(rows)
+        for row in rows:
+            self._append(row)
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()
@@ -1423,7 +1551,12 @@ class WalStore:
         at any write boundary recovers to the last complete commit on
         reopen -- with the request identifier free again when its commit
         never became durable, and answered with the original seq when it
-        did.
+        did. When the store was opened with max_bytes, the whole batch --
+        every change record plus the sealing commit -- is prechecked
+        against the limit as one unit after every check above: an
+        over-limit append raises WalCapacityError with not a single
+        record written. A retry of an already-durable request appends
+        nothing and is never limited.
         """
         self._check_writable()
         _validate_request_id(request_id)
@@ -1491,13 +1624,20 @@ class WalStore:
         # time, exactly as apply_batch does. An OSError propagates with
         # the old committed state and seq in place; the already-written
         # records form the batch's pending tail and the identifier stays
-        # unused until the commit record is durable.
+        # unused until the commit record is durable. The whole batch is
+        # prechecked against the capacity limit as one unit: when the
+        # complete records would exceed max_bytes, WalCapacityError is
+        # raised here and not a single record is written.
         new_seq = committed + 1
+        rows = []
         for change in normalized:
             record = dict(change)
             record["seq"] = new_seq
-            self._append(record)
-        self._append({"op": "commit", "seq": new_seq, "request_id": request_id})
+            rows.append(record)
+        rows.append({"op": "commit", "seq": new_seq, "request_id": request_id})
+        self._check_capacity(rows)
+        for row in rows:
+            self._append(row)
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()
@@ -1543,7 +1683,11 @@ class WalStore:
         durable but not yet sealed stays observable through
         pending_changes and removable through rollback, neither state nor
         commit_seq advances, and a process terminated at any write
-        boundary recovers to the previous commit on reopen.
+        boundary recovers to the previous commit on reopen. When the
+        store was opened with max_bytes, both records -- the set and the
+        sealing commit -- are prechecked against the limit as one unit
+        after every check above: an over-limit append raises
+        WalCapacityError with neither record written.
         """
         self._check_writable()
         _validate_key(key)
@@ -1587,7 +1731,11 @@ class WalStore:
         committed state and seq in place, a delete record already durable
         but not yet sealed stays observable through pending_changes and
         removable through rollback, and a process terminated at any write
-        boundary recovers to the previous commit on reopen.
+        boundary recovers to the previous commit on reopen. When the
+        store was opened with max_bytes, both records -- the delete and
+        the sealing commit -- are prechecked against the limit as one
+        unit after every check above: an over-limit append raises
+        WalCapacityError with neither record written.
         """
         self._check_writable()
         _validate_key(key)
@@ -1637,11 +1785,16 @@ class WalStore:
         # durable record at a time, exactly as apply_batch does. An
         # OSError propagates with the old committed state and seq in
         # place; an already-written change record forms the pending tail.
+        # Both records are prechecked against the capacity limit as one
+        # unit: when they would exceed max_bytes, WalCapacityError is
+        # raised here and neither record is written.
         new_seq = committed + 1
         record = dict(record)
         record["seq"] = new_seq
+        commit_row = {"op": "commit", "seq": new_seq}
+        self._check_capacity([record, commit_row])
         self._append(record)
-        self._append({"op": "commit", "seq": new_seq})
+        self._append(commit_row)
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()
@@ -1696,7 +1849,11 @@ class WalStore:
         pending_changes and removable through rollback, neither the
         in-memory state nor commit_seq advances, and a process terminated
         at any write boundary recovers to the last complete commit on
-        reopen with the unsealed part of the batch never applied.
+        reopen with the unsealed part of the batch never applied. When
+        the store was opened with max_bytes, the whole batch -- every
+        change record plus the sealing commit -- is prechecked against
+        the limit as one unit after every check above: an over-limit
+        append raises WalCapacityError with not a single record written.
         """
         self._check_writable()
         _validate_expected_versions(expected_versions)
@@ -1744,13 +1901,20 @@ class WalStore:
         # durable record at a time, exactly as apply_batch does. An
         # OSError propagates with the old committed state and seq in
         # place; the already-written records form the batch's pending
-        # tail.
+        # tail. The whole batch is prechecked against the capacity limit
+        # as one unit: when the complete records would exceed max_bytes,
+        # WalCapacityError is raised here and not a single record is
+        # written.
         new_seq = committed + 1
+        rows = []
         for change in normalized:
             record = dict(change)
             record["seq"] = new_seq
-            self._append(record)
-        self._append({"op": "commit", "seq": new_seq})
+            rows.append(record)
+        rows.append({"op": "commit", "seq": new_seq})
+        self._check_capacity(rows)
+        for row in rows:
+            self._append(row)
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()

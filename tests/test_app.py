@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import app
-from app import WalCorruptionError, WalPendingError, WalStore
+from app import WalCapacityError, WalCorruptionError, WalPendingError, WalStore
 
 
 class RecoverTest(unittest.TestCase):
@@ -7855,6 +7855,372 @@ class CrashExceptionPriorityTest(_CrashTestBase):
         s2 = WalStore(self.path, exclusive=True)
         self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2, "p": 9}, 3))
         s2.close()
+
+
+class CapacityLimitTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def _required_bytes(self, integrity, fn):
+        """Capture the capacity error's required_bytes for a planned call."""
+        s = WalStore(self.path, integrity=integrity, max_bytes=0)
+        try:
+            with self.assertRaises(WalCapacityError) as ctx:
+                fn(s)
+            return ctx.exception.required_bytes
+        finally:
+            s.close()
+
+    def test_max_bytes_validation(self):
+        for bad in (True, False, -1, -100, 1.5, "10", object()):
+            with self.assertRaises(ValueError):
+                WalStore(self.path, max_bytes=bad)
+        # A rejected call never creates or touches the log.
+        self.assertFalse(self.path.exists())
+        # Omitted and None both mean unlimited.
+        for kw in ({}, {"max_bytes": None}):
+            s = WalStore(self.path, **kw)
+            for i in range(5):
+                s.set("k%d" % i, "x" * 100)
+            s.commit()
+            s.close()
+            self.path.unlink()
+
+    def test_max_bytes_zero_allows_open_and_queries(self):
+        s = WalStore(self.path, max_bytes=0)
+        self.assertEqual((s.state, s.commit_seq), ({}, 0))
+        self.assertEqual(s.recover()["commit_seq"], 0)
+        self.assertFalse(self.path.exists())
+        s.close()
+
+    def test_set_rejected_atomically(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        before = (dict(s.state), s.commit_seq)
+        with self.assertRaises(WalCapacityError) as ctx:
+            s.set("b", 2)
+        err = ctx.exception
+        self.assertEqual(err.limit, size)
+        self.assertIsInstance(err.required_bytes, int)
+        self.assertGreater(err.required_bytes, size)
+        # Nothing changed: file bytes, seq, state, pending count.
+        self.assertEqual(self._size(), size)
+        self.assertEqual((dict(s.state), s.commit_seq), before)
+        self.assertEqual(s.pending_changes()["pending_count"], 0)
+        s.close()
+        # required_bytes is the exact file length had the write succeeded.
+        s = WalStore(self.path)
+        s.set("b", 2)
+        s.close()
+        self.assertEqual(self._size(), err.required_bytes)
+
+    def test_delete_and_commit_rejected(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        with self.assertRaises(WalCapacityError):
+            s.delete("a")
+        with self.assertRaises(WalCapacityError):
+            s.commit()
+        self.assertEqual(self._size(), size)
+        self.assertEqual((dict(s.state), s.commit_seq), ({"a": 1}, 1))
+        s.close()
+
+    def test_exact_fit_allowed(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        need = self._required_bytes(False, lambda st: st.set("b", 2))
+        s = WalStore(self.path, max_bytes=need)
+        s.set("b", 2)  # exactly at the limit: allowed
+        self.assertEqual(self._size(), need)
+        # The commit record needs more room and is refused; the pending
+        # record stays and can still be sealed once the limit allows.
+        with self.assertRaises(WalCapacityError) as ctx:
+            s.commit()
+        self.assertEqual(s.pending_changes()["pending_count"], 1)
+        s.close()
+        s = WalStore(self.path, max_bytes=ctx.exception.required_bytes)
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual(dict(s.state), {"a": 1, "b": 2})
+        self.assertEqual(self._size(), ctx.exception.required_bytes)
+        s.close()
+
+    def test_apply_batch_prechecked_as_a_whole(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        changes = [
+            {"op": "set", "key": "x", "value": "héllo"},
+            {"op": "delete", "key": "a"},
+            {"op": "set", "key": "y", "value": [1, 2.5, True, None]},
+        ]
+        need = self._required_bytes(False, lambda st: st.apply_batch(1, changes))
+        # Room for a strict prefix of the batch is not enough: nothing is
+        # written unless the whole batch plus its commit fits.
+        s = WalStore(self.path, max_bytes=need - 1)
+        with self.assertRaises(WalCapacityError) as ctx:
+            s.apply_batch(1, changes)
+        self.assertEqual(ctx.exception.required_bytes, need)
+        self.assertEqual(self._size(), size)
+        self.assertEqual(s.commit_seq, 1)
+        self.assertEqual(s.pending_changes()["pending_count"], 0)
+        s.close()
+        s = WalStore(self.path, max_bytes=need)
+        self.assertEqual(s.apply_batch(1, changes), 2)
+        self.assertEqual(self._size(), need)
+        self.assertEqual(s.commit_seq, 2)
+        s.close()
+
+    def test_empty_batch_commit_still_checked(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        with self.assertRaises(WalCapacityError):
+            s.apply_batch(1, [])
+        self.assertEqual(self._size(), size)
+        self.assertEqual(s.commit_seq, 1)
+        s.close()
+
+    def test_conditional_entries_rejected(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        with self.assertRaises(WalCapacityError):
+            s.set_if_version("b", 0, 2)
+        with self.assertRaises(WalCapacityError):
+            s.delete_if_version("a", 1)
+        with self.assertRaises(WalCapacityError):
+            s.apply_if_versions({"a": 1}, [{"op": "set", "key": "a", "value": 9}])
+        with self.assertRaises(WalCapacityError):
+            s.apply_idempotent("req-1", 1, [{"op": "set", "key": "b", "value": 2}])
+        with self.assertRaises(WalCapacityError):
+            s.restore(0)
+        self.assertEqual(self._size(), size)
+        self.assertEqual((dict(s.state), s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s.pending_changes()["pending_count"], 0)
+        s.close()
+
+    def test_commit_if_seq_rejected(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.set("b", 2)  # pending record to seal
+        s.close()
+        size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        with self.assertRaises(WalCapacityError) as ctx:
+            s.commit_if_seq(1)
+        self.assertEqual(ctx.exception.limit, size)
+        # The pending record is untouched and can still be sealed later.
+        self.assertEqual(s.pending_changes()["pending_count"], 1)
+        self.assertEqual(self._size(), size)
+        s.close()
+        s = WalStore(self.path, max_bytes=ctx.exception.required_bytes)
+        self.assertEqual(s.commit_if_seq(1), 2)
+        self.assertEqual(dict(s.state), {"a": 1, "b": 2})
+        s.close()
+
+    def test_idempotent_retry_not_limited(self):
+        s = WalStore(self.path)
+        s.apply_idempotent("req-1", 0, [{"op": "set", "key": "k", "value": "v"}])
+        s.close()
+        # A retry of an already-durable request appends nothing, so the
+        # capacity limit never applies to it.
+        s = WalStore(self.path, max_bytes=0)
+        self.assertEqual(
+            s.apply_idempotent("req-1", 0, [{"op": "set", "key": "k", "value": "v"}]),
+            1,
+        )
+        s.close()
+
+    def test_over_limit_log_opens_and_reads(self):
+        s = WalStore(self.path)
+        s.set("a", "x" * 100)
+        s.commit()
+        s.close()
+        size = self._size()
+        for kw in ({"max_bytes": 1}, {"max_bytes": size - 1}):
+            s = WalStore(self.path, **kw)
+            self.assertEqual(dict(s.state), {"a": "x" * 100})
+            self.assertEqual(s.commit_seq, 1)
+            self.assertEqual(s.get("a"), "x" * 100)
+            self.assertTrue(s.contains("a"))
+            self.assertEqual(len(s.scan()), 1)
+            self.assertEqual(s.snapshot()["commit_seq"], 1)
+            self.assertEqual(len(s.history()), 1)
+            self.assertEqual(s.key_version("a"), 1)
+            self.assertEqual(s.audit()["valid_bytes"], size)
+            v = s.view()
+            self.assertEqual(v.get("a"), "x" * 100)
+            s.close()
+        ro = WalStore(self.path, readonly=True, max_bytes=1)
+        self.assertEqual(ro.get("a"), "x" * 100)
+        ro.close()
+
+    def test_rollback_and_repair_tail_unrestricted(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        committed_size = self._size()
+        # Add a complete pending record and an unfinished tail fragment
+        # out of band.
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b", "value": 2, "seq": 2}\n')
+        s = WalStore(self.path, max_bytes=0)
+        self.assertEqual(s.rollback(), 1)
+        self.assertEqual(self._size(), committed_size)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b"')
+        frag_size = self._size()
+        r = s.repair_tail()
+        self.assertEqual(r["removed_bytes"], frag_size - committed_size)
+        self.assertEqual(self._size(), committed_size)
+        s.close()
+
+    def test_tail_fragment_not_truncated_on_rejection(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b"')  # incomplete JSON prefix
+        frag_size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        with self.assertRaises(WalCapacityError):
+            s.set("c", 3)
+        # The recognisable tail fragment survives the capacity refusal.
+        self.assertEqual(self._size(), frag_size)
+        s.close()
+        # A fitting write still discards the fragment exactly as before.
+        need = self._required_bytes(False, lambda st: st.set("c", 3))
+        s = WalStore(self.path, max_bytes=need)
+        s.set("c", 3)
+        self.assertEqual(self._size(), need)
+        s.close()
+
+    def test_exception_priority_preserved(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        # Read-only and closed instances keep their priorities.
+        ro = WalStore(self.path, readonly=True, max_bytes=0)
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.set("b", 2)
+        ro.close()
+        s = WalStore(self.path, max_bytes=0)
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.set("b", 2)
+        # Pending records and conflicts keep priority over capacity.
+        s = WalStore(self.path, max_bytes=size)
+        s2 = WalStore(self.path)
+        s2.set("b", 2)  # complete pending record via a second handle
+        s2.close()
+        with self.assertRaises(WalPendingError):
+            s.apply_batch(1, [{"op": "set", "key": "c", "value": 3}])
+        s.rollback()
+        with self.assertRaises(app.WalConflictError):
+            s.apply_batch(7, [{"op": "set", "key": "c", "value": 3}])
+        # Corruption keeps priority over capacity.
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "bogus", "seq": 2}\n')
+        with self.assertRaises(WalCorruptionError):
+            s.set("c", 3)
+        s.close()
+
+    def test_protected_log_required_bytes(self):
+        s = WalStore(self.path, integrity=True)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        need = self._required_bytes(
+            True, lambda st: st.apply_batch(1, [{"op": "set", "key": "b", "value": 2}])
+        )
+        self.assertGreater(need, size)
+        s = WalStore(self.path, max_bytes=need - 1)
+        with self.assertRaises(WalCapacityError) as ctx:
+            st_changes = [{"op": "set", "key": "b", "value": 2}]
+            s.apply_batch(1, st_changes)
+        self.assertEqual(ctx.exception.required_bytes, need)
+        self.assertEqual(self._size(), size)
+        s.close()
+        # The prediction is exact even with integrity metadata chained.
+        s = WalStore(self.path, integrity=True, max_bytes=need)
+        self.assertEqual(s.apply_batch(1, [{"op": "set", "key": "b", "value": 2}]), 2)
+        self.assertEqual(self._size(), need)
+        s.close()
+        # The protected log still verifies cleanly on reopen.
+        s = WalStore(self.path, integrity=True)
+        self.assertEqual(dict(s.state), {"a": 1, "b": 2})
+        s.close()
+
+    def test_legacy_log_compatible(self):
+        # A log written by an older version (no max_bytes notion) opens and
+        # keeps working; the limit only constrains new appends.
+        with self.path.open("w", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "a", "value": 1, "seq": 1}\n')
+            f.write('{"op": "commit", "seq": 1}\n')
+        size = self._size()
+        s = WalStore(self.path, max_bytes=size)
+        self.assertEqual(dict(s.state), {"a": 1})
+        with self.assertRaises(WalCapacityError):
+            s.set("b", 2)
+        s.close()
+        s = WalStore(self.path)
+        s.set("b", 2)
+        s.commit()
+        self.assertEqual(dict(s.state), {"a": 1, "b": 2})
+        s.close()
+
+    def test_exclusive_and_strict_tail_combine(self):
+        s = WalStore(self.path, exclusive=True, strict_tail=True)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        size = self._size()
+        s = WalStore(self.path, exclusive=True, strict_tail=True, max_bytes=size)
+        with self.assertRaises(WalCapacityError):
+            s.set("b", 2)
+        self.assertEqual(self._size(), size)
+        s.close()
+        # A recognised tail fragment keeps raising WalTailError (strict
+        # policy priority) rather than WalCapacityError.
+        s = WalStore(self.path, strict_tail=True, max_bytes=0)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "b"')
+        with self.assertRaises(app.WalTailError):
+            s.set("c", 3)
+        s.close()
 
 
 if __name__ == "__main__":
