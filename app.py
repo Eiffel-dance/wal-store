@@ -13,6 +13,45 @@ class WalCorruptionError(ValueError):
     """Raised when the write-ahead log fails validation."""
 
 
+class WalTailError(Exception):
+    """Raised by a strict-tail store when an unfinished tail fragment is found.
+
+    strict_tail=True keeps every recover/audit validation rule but turns the
+    single recover-recognisable trailing interrupted-write fragment -- bytes
+    the default recovery rules would silently discard -- into a hard error,
+    at construction and at every later entry that replays the log. The log
+    is never truncated, appended to, or created, no candidate state or
+    commit_seq is adopted, and an exclusive lease is never left behind.
+
+    Attributes:
+        valid_bytes: accepted-prefix length exactly as audit() reports it;
+        tail_bytes: number of trailing fragment bytes (file size minus
+            valid_bytes);
+        tail_kind: one of "truncated_utf8" (truncated UTF-8 bytes at the
+            end; this kind wins whenever such bytes are present),
+            "incomplete_json" (an unterminated segment that is a strict
+            prefix of valid JSON), or "missing_terminator" (a complete
+            record passing every structural, field, seq, and integrity
+            check whose terminator never became durable).
+    """
+
+    def __init__(self, valid_bytes, tail_bytes, tail_kind):
+        if tail_kind not in (
+            "truncated_utf8",
+            "incomplete_json",
+            "missing_terminator",
+        ):
+            raise ValueError("unknown tail_kind: %r" % (tail_kind,))
+        self.valid_bytes = valid_bytes
+        self.tail_bytes = tail_bytes
+        self.tail_kind = tail_kind
+        super().__init__(
+            "unfinished tail fragment after %r valid byte(s): %r "
+            "trailing byte(s) of kind %r"
+            % (valid_bytes, tail_bytes, tail_kind)
+        )
+
+
 class WalIntegrityError(Exception):
     """Raised when integrity mode is requested for an unprotected log.
 
@@ -365,7 +404,10 @@ _LOCK_DIR = os.path.join(tempfile.gettempdir(), "walstore_locks")
 
 
 class WalStore:
-    def __init__(self, path, exclusive=False, readonly=False, integrity=False):
+    def __init__(
+        self, path, exclusive=False, readonly=False, integrity=False,
+        strict_tail=False,
+    ):
         # Validate every parameter before touching the path in any way: a
         # rejected call must never read, create, truncate, or append to the
         # log or its lock file.
@@ -386,6 +428,11 @@ class WalStore:
             raise ValueError(
                 "integrity must be a bool, got %r" % (type(integrity).__name__,)
             )
+        if not isinstance(strict_tail, bool):
+            raise ValueError(
+                "strict_tail must be a bool, got %r"
+                % (type(strict_tail).__name__,)
+            )
         self.path = Path(path)
         self.state = {}
         self.commit_seq = 0
@@ -404,6 +451,11 @@ class WalStore:
         self._integrity_requested = integrity
         self._protected = integrity
         self._chain_head = _CHAIN_SEED
+        # Strict tail-fragment recovery: when True, a recover-recognisable
+        # trailing interrupted-write fragment raises WalTailError instead of
+        # being silently discarded, both here and at every later replay
+        # entry. False preserves the default discard-and-repair behaviour.
+        self._strict_tail = strict_tail
         # Legacy per-normalized-path lease descriptor (kept for the exact
         # historical sibling-lock behaviour) plus the real-object identity
         # lease descriptors:
@@ -1907,7 +1959,7 @@ class WalStore:
                 pending_count,
                 valid_size,
                 committed_size,
-            ) = self._replay()
+            ) = self._replay(_strict=False)
         finally:
             self._valid_size = saved_valid_size
         file_size = self.path.stat().st_size if self.path.exists() else 0
@@ -1956,7 +2008,7 @@ class WalStore:
             pending_count,
             valid_size,
             _committed_size,
-        ) = self._replay()
+        ) = self._replay(_strict=False)
         file_size = self.path.stat().st_size if self.path.exists() else 0
         removed_bytes = file_size - valid_size
         if removed_bytes <= 0:
@@ -1991,7 +2043,7 @@ class WalStore:
             removed_bytes=removed_bytes,
         )
 
-    def _replay(self, snapshots=None, batches=None, pending_out=None):
+    def _replay(self, snapshots=None, batches=None, pending_out=None, _strict=None):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
         # appended, in commit order, so historical committed views can be
@@ -2005,10 +2057,26 @@ class WalStore:
         # delete items op/key; values are deep copies private to this
         # replay). All three are purely observational: the replay itself,
         # its return value, and the log are unaffected.
+        # _strict, when not None, overrides the store's strict_tail mode for
+        # this replay: audit()/repair_tail() pass False so they keep
+        # reporting/clearing a fragment even on a strict store, while every
+        # other entry leaves the default (self._strict_tail) in force. When
+        # strict, a recover-recognisable trailing fragment raises
+        # WalTailError after the whole log has passed every other
+        # validation rule (corruption still raises WalCorruptionError first)
+        # and before any format, boundary, or chain head is adopted.
+        if _strict is None:
+            strict = self._strict_tail
+        else:
+            strict = _strict
         candidate = {}
         pending = []
         committed = 0
         valid_size = 0
+        # Byte length of the log on disk (0 when it does not exist); the
+        # fragment length is file_size minus valid_size, exactly as audit
+        # reports tail_bytes.
+        file_size = 0
         # Byte offset just past the last durable commit record (0 when there
         # is no committed prefix); rollback truncates at exactly this point.
         committed_size = 0
@@ -2018,8 +2086,18 @@ class WalStore:
         # mix. chain is the running digest the next record must chain onto.
         log_protected = None
         chain = _CHAIN_SEED
+        # Classification of the single recover-recognisable trailing
+        # interrupted-write fragment, when one is present: truncated_utf8
+        # (truncated UTF-8 bytes at the end; this kind always wins) marks
+        # itself as soon as the decode boundary is known, while the final
+        # unterminated segment is marked incomplete_json or
+        # missing_terminator where its break is recognised. Both stay None
+        # when every byte belongs to the accepted prefix.
+        truncated_utf8_tail = False
+        json_tail_kind = None
         if self.path.exists():
             data = self.path.read_bytes()
+            file_size = len(data)
             try:
                 text = data.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -2028,6 +2106,7 @@ class WalStore:
                 # discarded. Invalid bytes anywhere else are corruption.
                 if exc.reason == "unexpected end of data" and exc.end == len(data):
                     text = data[: exc.start].decode("utf-8")
+                    truncated_utf8_tail = True
                 else:
                     raise WalCorruptionError("log is not valid UTF-8") from exc
             # splitlines() recognises every Unicode line boundary, while a
@@ -2072,6 +2151,7 @@ class WalStore:
                         # Interrupted write: the partial trailing record is
                         # discarded -- it is not replayed, not counted as
                         # pending, and its bytes stay behind valid_size.
+                        json_tail_kind = "incomplete_json"
                         break
                     raise WalCorruptionError("invalid JSON record: %r" % line) from exc
                 if not isinstance(row, dict):
@@ -2150,6 +2230,7 @@ class WalStore:
                     # rollback, so the next record must chain onto the last
                     # adopted (terminated) record, exactly as valid_size
                     # only covers the accepted prefix.
+                    json_tail_kind = "missing_terminator"
                     break
                 if log_protected:
                     chain = expected_ic
@@ -2206,24 +2287,52 @@ class WalStore:
                             "value": copy.deepcopy(p["value"]),
                         }
                     )
+        # A recover-recognisable trailing fragment, classified the same way
+        # audit counts tail_bytes: truncated UTF-8 bytes win the kind, then
+        # an incomplete JSON prefix, then a complete record missing its
+        # terminator. Complete, terminated uncommitted set/delete records
+        # are part of the accepted prefix (they advance valid_size) and are
+        # never a fragment.
+        tail_bytes = file_size - valid_size
+        if truncated_utf8_tail:
+            tail_kind = "truncated_utf8"
+        elif json_tail_kind is not None:
+            tail_kind = json_tail_kind
+        else:
+            tail_kind = None
+        # Format gate, decided purely from the local log_protected evidence
+        # so nothing on self is changed by a refusal. A non-empty log that
+        # is fully unprotected is a legacy log: the default mode keeps
+        # reading and extending it in the legacy format, but
+        # integrity=True refuses it with the unique WalIntegrityError --
+        # ahead of the strict-tail refusal and before any state, boundary,
+        # chain head, or mode is adopted, so WalIntegrityError keeps its
+        # existing priority over the discarded-fragment case.
+        if log_protected is False and self._integrity_requested:
+            raise WalIntegrityError(
+                "log is not empty and carries no integrity protection: %r"
+                % (str(self.path),)
+            )
+        if strict and tail_kind is not None:
+            # Strict mode: the fragment the default rules would silently
+            # discard is a hard error. Every other validation rule above has
+            # already run (corruption, a bad chain, a seq break, and a
+            # legacy log opened with integrity=True all raised first), and
+            # no candidate state, commit_seq, mode, cached boundary, or
+            # chain head is adopted; an exclusive lease is released by the
+            # constructor. audit() and repair_tail() (which pass
+            # _strict=False) are the intended observation/repair routes and
+            # never reach this raise.
+            raise WalTailError(valid_size, tail_bytes, tail_kind)
         # Adopt the format the log itself proved to have. A protected log
         # stays protected even when opened in the default mode; a log with
         # no parsed records at all (missing, empty, or only an
         # unrecognisable interrupted-write prefix) keeps the mode the store
         # already had, so an integrity=True store starts a protected chain
-        # on an empty log. A non-empty log that is fully unprotected is a
-        # legacy log: the default mode keeps reading and extending it in
-        # the legacy format, but integrity=True refuses it with the unique
-        # WalIntegrityError -- before any state, boundary, or chain head is
-        # adopted.
+        # on an empty log.
         if log_protected is True:
             self._protected = True
         elif log_protected is False:
-            if self._integrity_requested:
-                raise WalIntegrityError(
-                    "log is not empty and carries no integrity protection: %r"
-                    % (str(self.path),)
-                )
             self._protected = False
         self._chain_head = chain
         self._valid_size = valid_size

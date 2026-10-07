@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import app
-from app import WalCorruptionError, WalPendingError, WalStore
+from app import WalCorruptionError, WalPendingError, WalStore, WalTailError
 
 
 class RecoverTest(unittest.TestCase):
@@ -7424,6 +7424,356 @@ class CrashExceptionPriorityTest(_CrashTestBase):
         s2 = WalStore(self.path, exclusive=True)
         self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "b": 2, "p": 9}, 3))
         s2.close()
+
+
+class StrictTailTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def committed_prefix(self):
+        """A committed legacy log: {a: 1} at seq 1; returns its bytes."""
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.commit()
+        return self.path.read_bytes()
+
+    def protected_prefix(self):
+        """A committed protected log: {a: 1} at seq 1; returns its bytes."""
+        s = WalStore(self.path, integrity=True)
+        s.set("a", 1)
+        s.commit()
+        s.close()
+        return self.path.read_bytes()
+
+    def protected_chain_head(self, blob):
+        chain = app._CHAIN_SEED
+        for line in blob.decode("utf-8").splitlines():
+            row = json.loads(line)
+            core = json.dumps(
+                {k: v for k, v in row.items() if k != "ic"}, sort_keys=True
+            )
+            chain = app._chain_digest(chain, core)
+        return chain
+
+    # ----- parameter validation ---------------------------------------------
+
+    def test_strict_tail_param_must_be_bool(self):
+        for bad in (0, 1, "true", None, 1.0, [], object()):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                WalStore(self.path, strict_tail=bad)
+            # rejected before read/create or lease: nothing on disk
+            self.assertFalse(self.path.exists(), msg=repr(bad))
+        # even alongside exclusive=True the bad parameter is refused first
+        with self.assertRaises(ValueError):
+            WalStore(self.path, exclusive=True, strict_tail=1)
+        self.assertFalse(self.path.exists())
+
+    def test_default_is_non_strict(self):
+        prefix = self.committed_prefix()
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write('{"op": "set", "key": "x"')  # interrupted fragment
+        # explicit False and omission behave identically and discard the tail
+        for store in (WalStore(self.path), WalStore(self.path, strict_tail=False)):
+            self.assertEqual((store.state, store.commit_seq), ({"a": 1}, 1))
+            self.assertEqual(store.recover()["pending_count"], 0)
+        # the prefix bytes are still intact
+        self.assertTrue(self.path.read_bytes().startswith(prefix))
+
+    # ----- clean / missing / empty logs open normally -----------------------
+
+    def test_missing_empty_and_no_tail_open_in_strict_mode(self):
+        self.assertFalse(self.path.exists())
+        self.assertEqual(WalStore(self.path, strict_tail=True).commit_seq, 0)
+        self.assertFalse(self.path.exists())  # opening a missing log creates none
+        self.path.write_bytes(b"")
+        self.assertEqual(WalStore(self.path, strict_tail=True).commit_seq, 0)
+        prefix = self.committed_prefix()
+        s = WalStore(self.path, strict_tail=True)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        self.assertEqual(s.get("a"), 1)
+
+    def test_complete_uncommitted_records_are_pending_not_tail(self):
+        prefix = self.committed_prefix()
+        s = WalStore(self.path, strict_tail=True)
+        s.set("b", 2)  # complete, terminated, but uncommitted
+        pc = s.pending_changes()
+        self.assertEqual(pc["pending_count"], 1)
+        self.assertEqual(
+            pc["changes"], [{"op": "set", "key": "b", "value": 2}]
+        )
+        # reopen strict: still pending, no WalTailError
+        s2 = WalStore(self.path, strict_tail=True)
+        self.assertEqual(s2.recover()["pending_count"], 1)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1}, 1))
+        self.assertTrue(self.path.read_bytes().startswith(prefix))
+
+    # ----- the three fragment kinds at construction -------------------------
+
+    def _assert_tail(self, blob, kind, valid, tail):
+        self.path.write_bytes(blob)
+        with self.assertRaises(WalTailError) as cm:
+            WalStore(self.path, strict_tail=True)
+        e = cm.exception
+        self.assertEqual(e.tail_kind, kind)
+        self.assertEqual(e.valid_bytes, valid)
+        self.assertEqual(e.tail_bytes, tail)
+        # bytes are never modified by the refusing open
+        self.assertEqual(self.path.read_bytes(), blob)
+
+    def test_incomplete_json_fragment_raises(self):
+        prefix = self.committed_prefix()
+        frag = b'{"op": "set", "key": "x"'
+        blob = prefix + frag
+        self._assert_tail(blob, "incomplete_json", len(prefix), len(frag))
+
+    def test_missing_terminator_fragment_raises(self):
+        prefix = self.committed_prefix()
+        frag = json.dumps(
+            {"op": "set", "key": "x", "value": 9, "seq": 2}
+        ).encode("utf-8")
+        self._assert_tail(prefix + frag, "missing_terminator", len(prefix), len(frag))
+
+    def test_truncated_utf8_fragment_raises(self):
+        prefix = self.committed_prefix()
+        frag = b'{"op": "set", "key": "x", "value": "\xe6\x97'
+        self._assert_tail(prefix + frag, "truncated_utf8", len(prefix), len(frag))
+
+    def test_truncated_utf8_wins_over_incomplete_json(self):
+        prefix = self.committed_prefix()
+        # the segment is an incomplete JSON prefix AND ends in truncated UTF-8
+        frag = b'{"op": "set", "key": "x", "value": "\xe6\x97'
+        self.path.write_bytes(prefix + frag)
+        with self.assertRaises(WalTailError) as cm:
+            WalStore(self.path, strict_tail=True)
+        self.assertEqual(cm.exception.tail_kind, "truncated_utf8")
+
+    def test_fragment_only_log_has_zero_valid_bytes(self):
+        for blob, kind in (
+            (b'{"op": "set", "key": "x"', "incomplete_json"),
+            (b"\xe6\x97", "truncated_utf8"),
+        ):
+            self.path.write_bytes(blob)
+            with self.assertRaises(WalTailError) as cm:
+                WalStore(self.path, strict_tail=True)
+            self.assertEqual(
+                (cm.exception.valid_bytes, cm.exception.tail_kind),
+                (0, kind),
+            )
+            self.assertEqual(cm.exception.tail_bytes, len(blob))
+
+    def test_tail_kind_is_restricted(self):
+        import app as _app
+
+        with self.assertRaises(ValueError):
+            _app.WalTailError(0, 1, "bogus")
+
+    # ----- no adoption / no lease / no mutation on the refusing open --------
+
+    def test_refusal_adopts_nothing_and_releases_lease(self):
+        prefix = self.committed_prefix()
+        frag = b'{"op": "set", "key": "x"'
+        self.path.write_bytes(prefix + frag)
+        with self.assertRaises(WalTailError):
+            WalStore(self.path, exclusive=True, strict_tail=True)
+        # bytes untouched
+        self.assertEqual(self.path.read_bytes(), prefix + frag)
+        # the exclusive lease was released: a fresh exclusive open succeeds
+        again = WalStore(self.path, exclusive=True)
+        again.close()
+        # and no file was created/truncated; the fragment is still there
+        self.assertEqual(self.path.read_bytes(), prefix + frag)
+
+    # ----- every replay entry on a live strict store refuses ----------------
+
+    def test_all_entries_raise_after_tail_appears(self):
+        prefix = self.committed_prefix()
+        s = WalStore(self.path, strict_tail=True)
+        frag = b'{"op": "set", "key": "z"'
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(frag.decode("utf-8"))
+        read_calls = [
+            ("recover", ()),
+            ("get", ("a",)),
+            ("contains", ("a",)),
+            ("scan", ()),
+            ("snapshot", ()),
+            ("history", ()),
+            ("diff", (0, 1)),
+            ("key_version", ("a",)),
+            ("pending_changes", ()),
+        ]
+        write_calls = [
+            ("set", ("k", 1)),
+            ("delete", ("k",)),
+            ("commit", ()),
+            ("rollback", ()),
+            ("restore", (1,)),
+            ("apply_batch", (1, [])),
+            ("commit_if_seq", (1,)),
+            ("set_if_version", ("k", 0, 1)),
+            ("delete_if_version", ("k", 0)),
+            ("apply_if_versions", ({}, [])),
+        ]
+        for name, args in read_calls + write_calls:
+            with self.assertRaises(WalTailError, msg=name):
+                getattr(s, name)(*args)
+        # every rejection left the file and the pending view unchanged
+        self.assertEqual(self.path.read_bytes(), prefix + frag)
+        relaxed = WalStore(self.path, strict_tail=False)
+        self.assertEqual(relaxed.recover()["pending_count"], 0)
+        self.assertEqual((relaxed.state, relaxed.commit_seq), ({"a": 1}, 1))
+
+    # ----- audit reports, repair clears, then normal operation resumes ------
+
+    def test_audit_reports_and_repair_restores_strict_store(self):
+        prefix = self.committed_prefix()
+        s = WalStore(self.path, strict_tail=True, exclusive=True)
+        frag = b'{"op": "set", "key": "z"'
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(frag.decode("utf-8"))
+        # audit keeps reporting the boundary instead of refusing
+        a = s.audit()
+        self.assertEqual(a["valid_bytes"], len(prefix))
+        self.assertEqual(a["tail_bytes"], len(frag))
+        self.assertEqual(a["state"], {"a": 1})
+        # repair clears the fragment
+        r = s.repair_tail()
+        self.assertEqual(r["removed_bytes"], len(frag))
+        self.assertEqual(self.path.read_bytes(), prefix)
+        # the strict store is fully usable again
+        self.assertEqual(s.get("a"), 1)
+        s.set("m", 5)
+        self.assertEqual(s.commit(), 2)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1, "m": 5}, 2))
+        # a fresh strict reopen succeeds on the repaired log
+        s.close()
+        s2 = WalStore(self.path, strict_tail=True)
+        self.assertEqual((s2.state, s2.commit_seq), ({"a": 1, "m": 5}, 2))
+
+    def test_repeated_strict_opens_on_same_prefix_are_consistent(self):
+        prefix = self.committed_prefix()
+        frag = b'{"op": "set", "key": "x"'
+        self.path.write_bytes(prefix + frag)
+        seen = []
+        for _ in range(2):
+            try:
+                WalStore(self.path, strict_tail=True)
+            except WalTailError as e:
+                seen.append((e.valid_bytes, e.tail_bytes, e.tail_kind))
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(seen[0], (len(prefix), len(frag), "incomplete_json"))
+
+    # ----- corruption still takes priority -----------------------------------
+
+    def test_corruption_takes_priority_over_tail(self):
+        # corrupt content anywhere is WalCorruptionError, never WalTailError
+        for blob in (
+            b'{"op": "bogus", "seq": 1}\n',
+            b'{"op": "set", "key": "a", "value": 1, "seq": 5}\n',
+        ):
+            self.path.write_bytes(blob)
+            with self.assertRaises(WalCorruptionError, msg=blob):
+                WalStore(self.path, strict_tail=True)
+        # trailing garbage that is not a recognised fragment is corruption
+        self.path.unlink()
+        prefix = self.committed_prefix()
+        self.path.write_bytes(prefix + b"not json at all")
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, strict_tail=True)
+
+    def test_protected_integrity_mismatch_is_corruption_not_tail(self):
+        blob = self.protected_prefix()
+        head = self.protected_chain_head(blob)
+        rec = {"op": "set", "key": "x", "value": 9, "seq": 2, "ic": "0" * 64}
+        # a complete unterminated record with a wrong chain is corruption
+        self.path.write_bytes(
+            blob + json.dumps(rec, sort_keys=True).encode("utf-8")
+        )
+        with self.assertRaises(WalCorruptionError):
+            WalStore(self.path, strict_tail=True, integrity=True)
+        # sanity: the same shape with the correct chain is a missing_terminator tail
+        rec["ic"] = app._chain_digest(
+            head, json.dumps(
+                {"op": "set", "key": "x", "value": 9, "seq": 2},
+                sort_keys=True,
+            )
+        )
+        self.path.write_bytes(
+            blob + json.dumps(rec, sort_keys=True).encode("utf-8")
+        )
+        with self.assertRaises(WalTailError) as cm:
+            WalStore(self.path, strict_tail=True, integrity=True)
+        self.assertEqual(cm.exception.tail_kind, "missing_terminator")
+
+    # ----- protected logs across all three fragment kinds -------------------
+
+    def test_protected_fragment_kinds(self):
+        blob = self.protected_prefix()
+        # incomplete JSON prefix
+        self.path.write_bytes(blob + b'{"op": "set", "key": "x"')
+        with self.assertRaises(WalTailError) as cm:
+            WalStore(self.path, strict_tail=True, integrity=True)
+        self.assertEqual(cm.exception.tail_kind, "incomplete_json")
+        self.assertEqual(cm.exception.valid_bytes, len(blob))
+        # truncated UTF-8
+        self.path.write_bytes(
+            blob + b'{"op": "set", "key": "x", "value": "\xe6\x97'
+        )
+        with self.assertRaises(WalTailError) as cm:
+            WalStore(self.path, strict_tail=True, integrity=True)
+        self.assertEqual(cm.exception.tail_kind, "truncated_utf8")
+        # a protected strict store on a clean protected log stays protected
+        self.path.write_bytes(blob)
+        s = WalStore(self.path, strict_tail=True, integrity=True)
+        s.set("c", 3)
+        self.assertEqual(s.commit(), 2)
+        rows = [
+            json.loads(line)
+            for line in self.path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(all("ic" in row for row in rows))
+
+    # ----- readonly / legacy / integrity interactions -----------------------
+
+    def test_readonly_strict_store(self):
+        prefix = self.committed_prefix()
+        # a tailed log cannot be opened even read-only in strict mode
+        self.path.write_bytes(prefix + b'{"op": "set", "key": "x"')
+        with self.assertRaises(WalTailError):
+            WalStore(self.path, readonly=True, strict_tail=True)
+        # a clean read-only strict store serves queries and stays read-only
+        self.path.write_bytes(prefix)
+        ro = WalStore(self.path, readonly=True, strict_tail=True)
+        self.assertEqual(ro.get("a"), 1)
+        for name, args in (
+            ("set", ("k", 1)),
+            ("delete", ("k",)),
+            ("commit", ()),
+            ("repair_tail", ()),
+        ):
+            with self.assertRaises(app.WalReadOnlyError, msg=name):
+                getattr(ro, name)(*args)
+        ro.close()
+        with self.assertRaises(app.WalClosedError):
+            ro.get("a")
+
+    def test_legacy_log_strict_matches_default_and_integrity_priority(self):
+        prefix = self.committed_prefix()
+        # legacy (unprotected) log opens normally in strict default mode
+        s = WalStore(self.path, strict_tail=True)
+        self.assertEqual((s.state, s.commit_seq), ({"a": 1}, 1))
+        s.set("b", 2)
+        self.assertEqual(s.commit(), 2)
+        # a legacy log with a tail opened with integrity=True keeps raising
+        # WalIntegrityError, which outranks the strict-tail refusal
+        self.path.write_bytes(prefix + b'{"op": "set", "key": "x"')
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True, strict_tail=True)
 
 
 if __name__ == "__main__":
