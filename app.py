@@ -1,12 +1,25 @@
 import copy
 import errno
-import fcntl
 import hashlib
 import json
 import math
 import os
 import tempfile
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    # Windows has no fcntl module; the exclusive lease falls back to the
+    # MSVCRT byte-range lock below. Importing this module must never fail
+    # just because the Unix-only backend is missing.
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    # POSIX has no msvcrt module; the exclusive lease uses fcntl.flock.
+    msvcrt = None
 
 
 class WalCorruptionError(ValueError):
@@ -450,6 +463,51 @@ def _reject_duplicate_keys(pairs):
     return dict(pairs)
 
 
+# Errno values that report "the lock is already held by another open file
+# description" on either locking backend: EACCES/EAGAIN from flock(2),
+# EDEADLOCK from the MSVCRT byte-range lock. Only these map to WalBusyError;
+# every other failure stays the original OSError.
+_BUSY_ERRNOS = {errno.EACCES, errno.EAGAIN}
+for _errno_name in ("EWOULDBLOCK", "EDEADLK", "EDEADLOCK"):
+    _errno_value = getattr(errno, _errno_name, None)
+    if _errno_value is not None:
+        _BUSY_ERRNOS.add(_errno_value)
+del _errno_name, _errno_value
+
+
+def _lock_exclusive_nb(fd):
+    """Take a non-blocking exclusive lock on one open file description.
+
+    POSIX uses flock(2); Windows uses a one-byte MSVCRT byte-range lock at
+    offset 0 of the lock file. Both bind the lease to the open file
+    description itself, so two descriptors conflict even within one
+    process; both are released by the operating system when the descriptor
+    is closed or the process dies, however it dies; and both raise OSError
+    (one of _BUSY_ERRNOS) when the lock is already held elsewhere. The lock
+    files are never read or written, so the byte position the MSVCRT lock
+    is anchored at carries no meaning beyond naming the locked range.
+    """
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is None:
+        raise OSError("no file-locking backend available on this platform")
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+
+def _unlock_exclusive(fd):
+    """Release a lock taken by _lock_exclusive_nb on the same descriptor."""
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    if msvcrt is None:
+        raise OSError("no file-locking backend available on this platform")
+    # The MSVCRT unlock must name the exact range that was locked.
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 # Side-channel directory for the identity-based lease locks. It never holds
 # WAL bytes: per-real-object locks are named by device and inode, and the
 # concurrent-first-open interlock locks by the canonical target path. It is
@@ -636,7 +694,7 @@ class WalStore:
         # Legacy per-normalized-path lease descriptor (kept for the exact
         # historical sibling-lock behaviour) plus the real-object identity
         # lease descriptors:
-        #   _identity_fd  flock on a file named by the log's (dev, ino)
+        #   _identity_fd  lock on a file named by the log's (dev, ino)
         #   _gate_fd      serializes concurrent first creation of a missing log
         #   _pin_fd       open descriptor on the leased object, anchoring its
         #                 identity for the lifetime of the lease
@@ -669,7 +727,7 @@ class WalStore:
         )
 
     def _take_flock(self, lock_path):
-        """Open ``lock_path`` and take a non-blocking exclusive flock.
+        """Open ``lock_path`` and take a non-blocking exclusive lock on it.
 
         Returns the held descriptor. A lock already held by another open
         file description maps to WalBusyError; every other filesystem
@@ -678,10 +736,10 @@ class WalStore:
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive_nb(fd)
         except OSError as exc:
             os.close(fd)
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
+            if exc.errno in _BUSY_ERRNOS:
                 raise self._busy_error(self.path) from None
             raise
         return fd
@@ -738,7 +796,7 @@ class WalStore:
         return os.path.join(_LOCK_DIR, "new-" + digest + ".lock")
 
     def _lock_identity(self, dev, ino):
-        """Take the per-real-object flock for (dev, ino)."""
+        """Take the per-real-object lock for (dev, ino)."""
         fd = self._take_flock(self._identity_lock_path(dev, ino))
         self._identity_fd = fd
         self._leased_dev = dev
@@ -763,9 +821,10 @@ class WalStore:
     def _acquire_lease(self):
         """Take the exclusive write lease for this store's real log object.
 
-        The lease has three cooperating flocks, all held per open file
+        The lease has three cooperating file locks, all held per open file
         description so two exclusive instances conflict even within one
-        process, and all released by the kernel when the holder dies:
+        process, and all released by the operating system when the holder
+        dies:
 
         * a legacy sibling lock derived from the normalized absolute path,
           preserving the original same-spelling mutual exclusion;
@@ -819,7 +878,7 @@ class WalStore:
         self._lock_fd = None
         if fd is not None:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _unlock_exclusive(fd)
             except OSError:
                 pass
             try:
@@ -830,7 +889,7 @@ class WalStore:
         self._identity_fd = None
         if fd is not None:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _unlock_exclusive(fd)
             except OSError:
                 pass
             try:
@@ -841,7 +900,7 @@ class WalStore:
         self._gate_fd = None
         if fd is not None:
             try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _unlock_exclusive(fd)
             except OSError:
                 pass
             try:
@@ -878,7 +937,7 @@ class WalStore:
         self._gate_fd = None
         if gate is not None:
             try:
-                fcntl.flock(gate, fcntl.LOCK_UN)
+                _unlock_exclusive(gate)
             except OSError:
                 pass
             os.close(gate)
@@ -922,8 +981,8 @@ class WalStore:
         return False
 
     def __del__(self):
-        # Best-effort lease release at garbage collection; the kernel
-        # releases the flock on process death in any case.
+        # Best-effort lease release at garbage collection; the operating
+        # system releases the lock on process death in any case.
         try:
             self.close()
         except Exception:
