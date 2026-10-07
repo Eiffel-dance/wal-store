@@ -1,12 +1,123 @@
 import copy
 import errno
-import fcntl
 import hashlib
 import json
 import math
 import os
 import tempfile
 from pathlib import Path
+
+# The exclusive write lease needs a non-blocking, per-open-file-description
+# mutual-exclusion primitive that the kernel releases when the holder dies,
+# so two exclusive instances conflict even inside one process and a crashed
+# holder never leaves a stale lease. POSIX provides exactly that with
+# flock(2); Windows provides it with CreateFile and sharing disabled
+# (dwShareMode=0), where the sharing mode is enforced per handle by the
+# kernel. Both backends are stdlib-only and expose the same acquire/release
+# contract below, so the lease logic is platform-neutral. Importing this
+# module never requires a Unix-only (or Windows-only) module.
+_IS_WINDOWS = os.name == "nt"
+
+# Constants for the Windows backend. They are plain values, defined
+# unconditionally so the backend functions below reference no name that
+# only one platform provides.
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_OPEN_ALWAYS = 4
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_INVALID_HANDLE_VALUE = -1
+# GetLastError codes that mean "another handle holds the object".
+_ERROR_SHARING_VIOLATION = 32
+_ERROR_LOCK_VIOLATION = 33
+
+if _IS_WINDOWS:
+    import ctypes
+    import ctypes.wintypes
+
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _CreateFileW = _kernel32.CreateFileW
+    _CreateFileW.argtypes = (
+        ctypes.wintypes.LPCWSTR,  # lpFileName
+        ctypes.wintypes.DWORD,  # dwDesiredAccess
+        ctypes.wintypes.DWORD,  # dwShareMode
+        ctypes.c_void_p,  # lpSecurityAttributes
+        ctypes.wintypes.DWORD,  # dwCreationDisposition
+        ctypes.wintypes.DWORD,  # dwFlagsAndAttributes
+        ctypes.c_void_p,  # hTemplateFile
+    )
+    _CreateFileW.restype = ctypes.wintypes.HANDLE
+    _CloseHandle = _kernel32.CloseHandle
+    _CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+    _CloseHandle.restype = ctypes.wintypes.BOOL
+else:
+    import fcntl
+
+# errno.ESTALE is not defined by every platform's errno module (notably
+# Windows); the identity-swap guard only needs a stable, recognizable code.
+_ESTALE = getattr(errno, "ESTALE", errno.EIO)
+
+
+class _LeaseHeld(Exception):
+    """Internal signal: the lease lock is held by another handle/process."""
+
+
+def _acquire_platform_lock(lock_path):
+    """Open ``lock_path`` (creating it) and take the exclusive lease lock.
+
+    Returns an opaque held-lock token for ``_release_platform_lock``. A lock
+    already held by another open file description raises ``_LeaseHeld``;
+    every other filesystem failure (including an unresolvable or
+    inaccessible lock location) propagates as the original OSError.
+    """
+    if _IS_WINDOWS:
+        # dwShareMode=0 denies every subsequent open of this file -- read,
+        # write, and delete -- for as long as the handle lives, including
+        # opens from the same process. That mirrors flock's per-open-file-
+        # description exclusion, and the kernel drops the reservation when
+        # the handle closes or the process dies.
+        handle = _CreateFileW(
+            os.fspath(lock_path),
+            _GENERIC_READ | _GENERIC_WRITE,
+            0,
+            None,
+            _OPEN_ALWAYS,
+            _FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        if handle is None or handle == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            if err in (_ERROR_SHARING_VIOLATION, _ERROR_LOCK_VIOLATION):
+                raise _LeaseHeld from None
+            raise ctypes.WinError(err)
+        return handle
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            raise _LeaseHeld from None
+        raise
+    return fd
+
+
+def _release_platform_lock(token):
+    """Release a token from ``_acquire_platform_lock``; never raises."""
+    if token is None:
+        return
+    if _IS_WINDOWS:
+        # Closing the handle lifts the sharing reservation.
+        _CloseHandle(token)
+        return
+    try:
+        fcntl.flock(token, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(token)
+    except OSError:
+        pass
 
 
 class WalCorruptionError(ValueError):
@@ -636,7 +747,7 @@ class WalStore:
         # Legacy per-normalized-path lease descriptor (kept for the exact
         # historical sibling-lock behaviour) plus the real-object identity
         # lease descriptors:
-        #   _identity_fd  flock on a file named by the log's (dev, ino)
+        #   _identity_fd  lock on a file named by the log's (dev, ino)
         #   _gate_fd      serializes concurrent first creation of a missing log
         #   _pin_fd       open descriptor on the leased object, anchoring its
         #                 identity for the lifetime of the lease
@@ -669,22 +780,17 @@ class WalStore:
         )
 
     def _take_flock(self, lock_path):
-        """Open ``lock_path`` and take a non-blocking exclusive flock.
+        """Open ``lock_path`` and take a non-blocking exclusive lease lock.
 
-        Returns the held descriptor. A lock already held by another open
+        Returns the held lock token. A lock already held by another open
         file description maps to WalBusyError; every other filesystem
         failure (including an unresolvable lock location) stays an OSError.
         """
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            os.close(fd)
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
-                raise self._busy_error(self.path) from None
-            raise
-        return fd
+            return _acquire_platform_lock(lock_path)
+        except _LeaseHeld:
+            raise self._busy_error(self.path) from None
 
     def _identity_stat(self):
         """Identity of the log's real object, following every symlink.
@@ -738,7 +844,7 @@ class WalStore:
         return os.path.join(_LOCK_DIR, "new-" + digest + ".lock")
 
     def _lock_identity(self, dev, ino):
-        """Take the per-real-object flock for (dev, ino)."""
+        """Take the per-real-object lease lock for (dev, ino)."""
         fd = self._take_flock(self._identity_lock_path(dev, ino))
         self._identity_fd = fd
         self._leased_dev = dev
@@ -751,7 +857,7 @@ class WalStore:
             st = os.fstat(fd)
             if (st.st_dev, st.st_ino) != (self._leased_dev, self._leased_ino):
                 raise OSError(
-                    errno.ESTALE,
+                    _ESTALE,
                     "wal object identity changed under the exclusive lease: %r"
                     % (str(self.path),),
                 )
@@ -763,9 +869,9 @@ class WalStore:
     def _acquire_lease(self):
         """Take the exclusive write lease for this store's real log object.
 
-        The lease has three cooperating flocks, all held per open file
-        description so two exclusive instances conflict even within one
-        process, and all released by the kernel when the holder dies:
+        The lease has three cooperating platform locks, all held per open
+        file description so two exclusive instances conflict even within
+        one process, and all released by the kernel when the holder dies:
 
         * a legacy sibling lock derived from the normalized absolute path,
           preserving the original same-spelling mutual exclusion;
@@ -815,39 +921,15 @@ class WalStore:
 
     def _release_lease_fds(self):
         """Release every lease-side descriptor; tolerant of partial opens."""
-        fd = self._lock_fd
+        token = self._lock_fd
         self._lock_fd = None
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        fd = self._identity_fd
+        _release_platform_lock(token)
+        token = self._identity_fd
         self._identity_fd = None
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        fd = self._gate_fd
+        _release_platform_lock(token)
+        token = self._gate_fd
         self._gate_fd = None
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        _release_platform_lock(token)
         fd = self._pin_fd
         self._pin_fd = None
         if fd is not None:
@@ -876,12 +958,7 @@ class WalStore:
         self._pin_object()
         gate = self._gate_fd
         self._gate_fd = None
-        if gate is not None:
-            try:
-                fcntl.flock(gate, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(gate)
+        _release_platform_lock(gate)
 
     def _verify_leased_object(self, f):
         """Guard every write-mode WAL open against an identity swap.
@@ -896,7 +973,7 @@ class WalStore:
         st = os.fstat(f.fileno())
         if (st.st_dev, st.st_ino) != (self._leased_dev, self._leased_ino):
             raise OSError(
-                errno.ESTALE,
+                _ESTALE,
                 "wal object identity changed under the exclusive lease: %r"
                 % (str(self.path),),
             )
@@ -923,7 +1000,7 @@ class WalStore:
 
     def __del__(self):
         # Best-effort lease release at garbage collection; the kernel
-        # releases the flock on process death in any case.
+        # releases the lock on process death in any case.
         try:
             self.close()
         except Exception:
