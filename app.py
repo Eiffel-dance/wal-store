@@ -137,6 +137,12 @@ _NUMBER_TAILS = frozenset({".", "e", "E", "e+", "e-", "E+", "E-"})
 # records never contain it; a protected log carries it on every record.
 _INTEGRITY_FIELD = "ic"
 
+# Optional field on a commit record binding the sealed batch to the
+# caller-supplied idempotency identifier of apply_idempotent. Records
+# without it behave exactly as before; the identifier only becomes used
+# once the commit record carrying it is complete and durable.
+_REQUEST_FIELD = "rid"
+
 # Domain-separated seed of the integrity hash chain: the prev-chain value
 # assumed for the first record of a protected log.
 _CHAIN_SEED = hashlib.sha256(b"walstore-integrity-chain-v1").hexdigest()
@@ -370,6 +376,25 @@ def _normalize_changes(changes):
                 "records may be batched" % (index, op)
             )
     return normalized
+
+
+def _changes_identical(left, right):
+    """Whether two normalized change sequences are the same batch.
+
+    Comparison is positional and type-aware: the sequences must agree in
+    length, and each pair of records must share the op and the key, with
+    set values compared under the JSON-type-aware rules (1 and true --
+    nested or not -- are never the same change). This is the exact
+    equivalence apply_idempotent uses to recognise a retried batch.
+    """
+    if len(left) != len(right):
+        return False
+    for a, b in zip(left, right):
+        if a["op"] != b["op"] or a["key"] != b["key"]:
+            return False
+        if a["op"] == "set" and not _json_equal(a["value"], b["value"]):
+            return False
+    return True
 
 
 def _reject_constant(constant):
@@ -1230,6 +1255,145 @@ class WalStore:
         self.recover()
         return self.commit_seq
 
+    def apply_idempotent(self, request_id, base_seq, changes):
+        """Atomically commit a batch under a durable idempotency identifier.
+
+        The retry-safe counterpart of apply_batch: ``request_id`` is a
+        caller-chosen, non-empty string persisted in the batch's commit
+        record, so a caller whose response was lost after the commit
+        became durable can re-issue the identical request and receive the
+        original commit seq instead of committing the batch twice.
+
+        On the first use of an unclaimed identifier the call behaves
+        exactly like apply_batch: the log must be settled at the last
+        commit boundary, ``base_seq`` must equal the latest committed
+        seq, the changes are appended in the caller's order, and one
+        commit record -- carrying ``request_id`` -- seals them with seq =
+        latest committed seq + 1. Returns the new commit_seq; state,
+        recover, snapshot, history, diff, scan, pending_changes,
+        key_version, and a reopen then reflect the same committed result
+        as an equivalent apply_batch call.
+
+        When ``request_id`` already names a complete durable commit, a
+        call repeating the identical ``base_seq`` and change sequence --
+        same length, same order, same ops and keys, and set values equal
+        under the JSON-type-aware rules (1 and true, nested or not, never
+        count as the same change) -- returns the original commit seq
+        without appending a byte, changing state, or consuming a seq,
+        even when later commits have since landed. The same identifier
+        with a different base_seq or a different change sequence raises
+        WalConflictError, as does an unused identifier whose base_seq is
+        not the latest committed seq.
+
+        ``request_id`` must be a non-empty string, ``base_seq`` a
+        non-boolean non-negative integer, and ``changes`` a list or tuple
+        under exactly the apply_batch record rules; every argument error
+        raises ValueError before the log is read or created. A closed
+        instance raises WalClosedError and a read-only one
+        WalReadOnlyError before any argument is checked, exactly as the
+        other mutating entries do. The log is then validated under the
+        exact recover rules (any corruption raises WalCorruptionError)
+        and must be settled at the last commit: complete uncommitted
+        set/delete records or a recover/audit-recognisable unfinished
+        tail fragment raise WalPendingError. None of these rejections
+        writes, truncates, or alters in-memory state, and none consumes
+        a seq.
+
+        The identifier is bound to the batch only inside the sealing
+        commit record, so it counts as used only once that record is
+        complete and durable: a process terminated while the change
+        records are being written leaves them as ordinary pending records
+        (observable through pending_changes, removable through rollback),
+        the identifier stays unclaimed, and the same request may be
+        issued again after the cleanup. The write phase otherwise follows
+        the same single-writer lease, per-record flush+fsync, and seq
+        monotonicity rules as apply_batch: an OSError from any record
+        propagates unchanged with the old committed state and seq in
+        place, and a reopen recovers exactly the last complete commit.
+        """
+        self._check_writable()
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError(
+                "request_id must be a non-empty string, got %r" % (request_id,)
+            )
+        if (
+            isinstance(base_seq, bool)
+            or not isinstance(base_seq, int)
+            or base_seq < 0
+        ):
+            raise ValueError(
+                "base_seq must be a non-negative integer, got %r" % (base_seq,)
+            )
+        # Validate and normalize every change up front, exactly as
+        # apply_batch does: a rejected call must never create, truncate,
+        # or append to the log or alter in-memory state.
+        normalized = _normalize_changes(changes)
+        # Full recover-rule validation of the log, purely into local
+        # objects: corruption raises WalCorruptionError before anything is
+        # written, truncated, or adopted. The replay also exports every
+        # committed batch and every durable request-id binding.
+        batches = []
+        requests = []
+        (
+            _candidate,
+            committed,
+            pending_count,
+            _valid_size,
+            _committed_size,
+        ) = self._replay(batches=batches, requests=requests)
+        # The log must be settled at the last commit before a new batch is
+        # spliced on: neither complete uncommitted records nor a
+        # recognisable unfinished tail fragment may be present (same rule
+        # as restore and apply_batch).
+        file_size = self.path.stat().st_size if self.path.exists() else 0
+        if pending_count > 0 or file_size > self._valid_size:
+            raise WalPendingError(
+                "log is not settled at commit %r: %r pending record(s), "
+                "an unfinished tail fragment is present"
+                % (committed, pending_count)
+            )
+        # Idempotency lookup: the identifier names at most one durable
+        # commit, and its base_seq is that commit's seq minus one (the
+        # log was settled at the previous boundary when it was written).
+        original_seq = None
+        for rid, seq in requests:
+            if rid == request_id:
+                original_seq = seq
+                break
+        if original_seq is not None:
+            original_changes = dict(batches)[original_seq]
+            if base_seq == original_seq - 1 and _changes_identical(
+                normalized, original_changes
+            ):
+                # An exact retry of a commit that already became durable:
+                # return the original seq without appending a byte,
+                # changing state, or consuming a seq.
+                return original_seq
+            raise WalConflictError(
+                "request_id %r is already committed with different "
+                "parameters" % (request_id,)
+            )
+        if base_seq != committed:
+            raise WalConflictError(
+                "base_seq %r does not match latest committed seq %r"
+                % (base_seq, committed)
+            )
+        # Append each change record and then the sealing commit carrying
+        # the identifier, one durable record at a time, exactly as
+        # apply_batch does. An OSError propagates with the old committed
+        # state and seq in place; the already-written records form the
+        # batch's pending tail and the identifier stays unclaimed.
+        new_seq = committed + 1
+        for change in normalized:
+            record = dict(change)
+            record["seq"] = new_seq
+            self._append(record)
+        self._append({"op": "commit", "seq": new_seq, _REQUEST_FIELD: request_id})
+        # Adopt the new committed view only once its commit boundary is
+        # durable, exactly as commit() does.
+        self.recover()
+        return self.commit_seq
+
     def set_if_version(self, key, expected_seq, value):
         """Optimistically write one set record, guarded by the key's version.
 
@@ -2042,7 +2206,10 @@ class WalStore:
             removed_bytes=removed_bytes,
         )
 
-    def _replay(self, snapshots=None, batches=None, pending_out=None, strict=None):
+    def _replay(
+        self, snapshots=None, batches=None, pending_out=None, strict=None,
+        requests=None,
+    ):
         # snapshots: optional caller-provided list; when given, one
         # (seq, deep-copy-of-state) entry per durable commit record is
         # appended, in commit order, so historical committed views can be
@@ -2054,8 +2221,10 @@ class WalStore:
         # once at the end with the records of the single trailing
         # uncommitted batch in log order (set items carry op/key/value,
         # delete items op/key; values are deep copies private to this
-        # replay). All three are purely observational: the replay itself,
-        # its return value, and the log are unaffected.
+        # replay). requests: likewise, one (request_id, seq) entry per
+        # durable commit record carrying an idempotency identifier, in
+        # commit order. All four are purely observational: the replay
+        # itself, its return value, and the log are unaffected.
         #
         # strict selects the tail policy: None means the store's own
         # strict_tail setting (every replaying public entry), False forces
@@ -2169,9 +2338,23 @@ class WalStore:
                 expected_fields = (
                     schema | {_INTEGRITY_FIELD} if log_protected else schema
                 )
-                if set(row) != expected_fields:
+                actual_fields = set(row)
+                # A commit record may additionally carry the idempotency
+                # identifier of apply_idempotent; every other record keeps
+                # its exact historical field set.
+                if op == "commit" and actual_fields != expected_fields:
+                    expected_fields = expected_fields | {_REQUEST_FIELD}
+                if actual_fields != expected_fields:
                     raise WalCorruptionError(
                         "bad fields for op %r: %r" % (op, sorted(row))
+                    )
+                if _REQUEST_FIELD in row and (
+                    not isinstance(row[_REQUEST_FIELD], str)
+                    or not row[_REQUEST_FIELD]
+                ):
+                    raise WalCorruptionError(
+                        "request id is not a non-empty string: %r"
+                        % (row[_REQUEST_FIELD],)
                     )
                 seq = row["seq"]
                 if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
@@ -2229,6 +2412,12 @@ class WalStore:
                 if log_protected:
                     chain = expected_ic
                 if op == "commit":
+                    if requests is not None and _REQUEST_FIELD in row:
+                        # The idempotency identifier becomes observable
+                        # exactly when its commit record is complete and
+                        # durable; an unterminated fragment never reaches
+                        # this point.
+                        requests.append((row[_REQUEST_FIELD], seq))
                     if batches is not None:
                         # The batch's changes in original log order, with
                         # values deep-copied so the recorded entry can
