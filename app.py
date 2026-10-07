@@ -96,6 +96,35 @@ class WalConflictError(Exception):
     """
 
 
+class WalCapacityError(Exception):
+    """Raised when an append would grow the WAL past its max_bytes limit.
+
+    The check runs only after the existing recover-rule validation has
+    passed and compares the limit with the exact file length a successful
+    write (or a fully pre-checked batch) would leave behind -- the
+    recognised tail fragment discarded, every record of the operation
+    appended together with its newline. On refusal no record is written,
+    the tail fragment is not truncated, and state, seq, commit_seq,
+    pending_count, and the file bytes all stay exactly as they were; the
+    rejected uncommitted records can still be handled with commit(),
+    rollback(), or repair_tail().
+
+    Attributes:
+        limit: the configured max_bytes.
+        required_bytes: the exact final file length the operation would
+            have produced on success.
+    """
+
+    def __init__(self, limit, required_bytes, path=None):
+        self.limit = limit
+        self.required_bytes = required_bytes
+        location = "" if path is None else " of %r" % (str(path),)
+        super().__init__(
+            "WAL%s would grow to %r bytes, exceeding max_bytes %r"
+            % (location, required_bytes, limit)
+        )
+
+
 class RecoveryResult(dict):
     """Plain result mapping; keys are also readable as attributes."""
 
@@ -292,6 +321,23 @@ def _validate_expected_seq(expected_seq):
         raise ValueError(
             "expected_seq must be a non-negative integer, got %r"
             % (expected_seq,)
+        )
+
+
+def _validate_max_bytes(max_bytes):
+    # The optional durable WAL size limit: None means unlimited; anything
+    # else must be a non-boolean non-negative integer. Rejected before the
+    # access path, exactly like the other constructor parameters.
+    if max_bytes is None:
+        return
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 0
+    ):
+        raise ValueError(
+            "max_bytes must be a non-negative integer or omitted, got %r"
+            % (max_bytes,)
         )
 
 
@@ -536,7 +582,7 @@ class WalView:
 class WalStore:
     def __init__(
         self, path, exclusive=False, readonly=False, integrity=False,
-        strict_tail=False,
+        strict_tail=False, max_bytes=None,
     ):
         # Validate every parameter before touching the path in any way: a
         # rejected call must never read, create, truncate, or append to the
@@ -563,7 +609,14 @@ class WalStore:
                 "strict_tail must be a bool, got %r"
                 % (type(strict_tail).__name__,)
             )
+        _validate_max_bytes(max_bytes)
         self.path = Path(path)
+        # Optional durable WAL size limit. None means unlimited; otherwise
+        # no successful append path may leave the file longer than this
+        # many bytes. The limit only constrains growth after a successful
+        # write: opening, recover, and read-only queries never fail on a
+        # log that already exceeds it, and legacy logs stay compatible.
+        self.max_bytes = max_bytes
         self.state = {}
         self.commit_seq = 0
         # Byte length of the durable log prefix as judged by the latest
@@ -910,7 +963,7 @@ class WalStore:
         else:
             self._verify_leased_object(f)
 
-    def _revalidate_for_append(self):
+    def _revalidate_for_append(self, row=None):
         """Validate the whole log by the exact recover rules before appending.
 
         A store can stay open while its log is appended to or damaged out of
@@ -923,6 +976,14 @@ class WalStore:
         WalCorruptionError without appending, truncating, or adopting anything
         -- state, commit_seq, and the byte boundary a later rollback observes
         are all left untouched.
+
+        When ``row`` is given the capacity gate runs next: the exact file
+        length a successful append leaves behind -- the accepted prefix
+        length (the recognised tail fragment discarded, exactly as the
+        normal append path does) plus this record and its terminator -- is
+        compared with max_bytes, and WalCapacityError is raised BEFORE the
+        tail fragment is removed, so a refused write leaves the file, its
+        tail bytes, and every cached boundary untouched.
 
         The only bytes allowed beyond the replayed valid_bytes are the single
         trailing interrupted-write fragment the recovery rules recognise; that
@@ -943,6 +1004,14 @@ class WalStore:
                 valid_size,
                 _committed_size,
             ) = self._replay()
+            if row is not None:
+                # Gate before any truncation: required_bytes is the exact
+                # final file length on success, measured after the
+                # recognised tail fragment the append below would discard.
+                payload, _new_chain = self._record_payload(
+                    row, committed + 1, self._chain_head
+                )
+                self._check_capacity(valid_size + len(payload))
             file_size = self.path.stat().st_size if self.path.exists() else 0
             if file_size > valid_size:
                 # The replay has already proved the bytes beyond valid_size
@@ -965,6 +1034,54 @@ class WalStore:
             raise
         return candidate, committed
 
+    def _record_payload(self, row, seq, chain):
+        """The exact bytes one append of ``row`` writes, and the new chain head.
+
+        ``row`` is the record without a stamped seq; ``seq`` is the seq the
+        record carries, and ``chain`` the integrity digest it chains onto
+        (ignored for an unprotected log). Returns (payload_bytes, new_chain)
+        where payload_bytes includes the terminating newline and new_chain
+        is the chain head the next protected record must use.
+        """
+        record = dict(row)
+        record["seq"] = seq
+        if self._protected:
+            core_line = json.dumps(record, sort_keys=True)
+            new_chain = _chain_digest(chain, core_line)
+            record[_INTEGRITY_FIELD] = new_chain
+        else:
+            new_chain = chain
+        payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+        return payload, new_chain
+
+    def _check_capacity(self, required_bytes):
+        if self.max_bytes is not None and required_bytes > self.max_bytes:
+            raise WalCapacityError(
+                self.max_bytes, required_bytes, self.path
+            )
+
+    def _precheck_capacity(self, rows, base_size, committed):
+        """Whole-operation capacity gate for the multi-record write entries.
+
+        Runs after the entry's own recover-rule validation and
+        preconditions have passed and before any record is written: it
+        computes the exact final file length of the complete sequence of
+        records -- ``rows`` in append order, every one carrying
+        ``committed + 1`` as its seq, integrity metadata threaded record
+        by record exactly as the appends will write it -- appended to the
+        settled accepted prefix of ``base_size`` bytes, and refuses the
+        whole operation with WalCapacityError when it would exceed
+        max_bytes. A no-limit store returns immediately.
+        """
+        if self.max_bytes is None:
+            return
+        total = base_size
+        chain = self._chain_head
+        for row in rows:
+            payload, chain = self._record_payload(row, committed + 1, chain)
+            total += len(payload)
+        self._check_capacity(total)
+
     def _append(self, row):
         """Durably append one log record after head-to-tail revalidation.
 
@@ -981,7 +1098,7 @@ class WalStore:
         never masquerade as a committed record on reopen, and no new state is
         adopted before the record is durable.
         """
-        candidate, committed = self._revalidate_for_append()
+        candidate, committed = self._revalidate_for_append(row)
         record = dict(row)
         record["seq"] = committed + 1
         if self._protected:
@@ -1242,21 +1359,32 @@ class WalStore:
         # with a different value under JSON-type-aware comparison, is a
         # set; a key present now but absent in the target is a delete.
         new_seq = committed + 1
+        batch_rows = []
         for key in sorted(set(current) | set(target)):
             if key not in target:
-                self._append({"op": "delete", "key": key, "seq": new_seq})
+                batch_rows.append({"op": "delete", "key": key})
             elif key not in current or not _json_equal(current[key], target[key]):
                 # Deep copy: the adopted value must not share objects with
                 # the replay's snapshot, which the caller could mutate.
-                self._append(
+                batch_rows.append(
                     {
                         "op": "set",
                         "key": key,
                         "value": copy.deepcopy(target[key]),
-                        "seq": new_seq,
                     }
                 )
-        self._append({"op": "commit", "seq": new_seq})
+        batch_rows.append({"op": "commit"})
+        # Whole-operation capacity gate before the first record: the exact
+        # final file length after every change record and the sealing
+        # commit (tail discarded, terminators included) must fit. The log
+        # is settled here, so the accepted prefix equals the current file
+        # length. A refusal writes nothing and leaves seq, state, and the
+        # file bytes untouched.
+        self._precheck_capacity(batch_rows, self._valid_size, committed)
+        for row in batch_rows:
+            row_with_seq = dict(row)
+            row_with_seq["seq"] = new_seq
+            self._append(row_with_seq)
         # Adopt the new committed view only once its commit boundary is
         # durable, exactly as commit() does.
         self.recover()
@@ -1352,8 +1480,13 @@ class WalStore:
         # Append each change record and then the sealing commit, one
         # durable record at a time, exactly as restore does. An OSError
         # propagates with the old committed state and seq in place; the
-        # already-written records form the batch's pending tail.
+        # already-written records form the batch's pending tail. The
+        # whole-batch capacity gate runs first: the exact final file
+        # length of all changes plus the commit must fit max_bytes, and a
+        # refusal leaves the log, seq, state, and pending_count untouched.
         new_seq = committed + 1
+        batch_rows = list(normalized) + [{"op": "commit"}]
+        self._precheck_capacity(batch_rows, self._valid_size, committed)
         for change in normalized:
             record = dict(change)
             record["seq"] = new_seq
@@ -1491,8 +1624,14 @@ class WalStore:
         # time, exactly as apply_batch does. An OSError propagates with
         # the old committed state and seq in place; the already-written
         # records form the batch's pending tail and the identifier stays
-        # unused until the commit record is durable.
+        # unused until the commit record is durable. The whole-batch
+        # capacity gate (commit record carrying the request_id included)
+        # runs first; a refusal appends nothing and consumes no seq.
         new_seq = committed + 1
+        batch_rows = list(normalized) + [
+            {"op": "commit", "request_id": request_id}
+        ]
+        self._precheck_capacity(batch_rows, self._valid_size, committed)
         for change in normalized:
             record = dict(change)
             record["seq"] = new_seq
@@ -1637,7 +1776,12 @@ class WalStore:
         # durable record at a time, exactly as apply_batch does. An
         # OSError propagates with the old committed state and seq in
         # place; an already-written change record forms the pending tail.
+        # The whole-operation capacity gate (change + sealing commit)
+        # runs first; a refusal appends neither record.
         new_seq = committed + 1
+        change_row = dict(record)
+        batch_rows = [change_row, {"op": "commit"}]
+        self._precheck_capacity(batch_rows, self._valid_size, committed)
         record = dict(record)
         record["seq"] = new_seq
         self._append(record)
@@ -1744,8 +1888,12 @@ class WalStore:
         # durable record at a time, exactly as apply_batch does. An
         # OSError propagates with the old committed state and seq in
         # place; the already-written records form the batch's pending
-        # tail.
+        # tail. The whole-batch capacity gate runs first: every change
+        # plus the sealing commit is measured and the operation refuses
+        # as a unit before the first record lands.
         new_seq = committed + 1
+        batch_rows = list(normalized) + [{"op": "commit"}]
+        self._precheck_capacity(batch_rows, self._valid_size, committed)
         for change in normalized:
             record = dict(change)
             record["seq"] = new_seq
