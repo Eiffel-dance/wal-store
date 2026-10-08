@@ -2146,6 +2146,315 @@ class HistoryTest(unittest.TestCase):
         )
 
 
+class HistoryPageTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()  # seq 1
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()  # seq 2
+        s.commit()  # seq 3: empty commit
+        s.set("tail", 9)  # uncommitted
+        return s
+
+    def walk(self, s, limit, **first):
+        # Page through the whole export, threading upper_seq and next_seq.
+        pages = []
+        page = s.history_page(limit=limit, **first)
+        while True:
+            pages.append(page)
+            if page["next_seq"] is None:
+                return pages
+            page = s.history_page(
+                until_seq=page["upper_seq"], after_seq=page["next_seq"],
+                limit=limit,
+            )
+
+    def test_first_page_pins_upper_seq(self):
+        s = self.build()
+        page = s.history_page(limit=2)
+        self.assertEqual(page["upper_seq"], 3)
+        self.assertEqual(page["next_seq"], 2)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [1, 2])
+        # entries are exactly the history() change objects, in commit order
+        self.assertEqual(page["entries"], s.history(0, 2))
+
+    def test_walk_covers_every_commit_exactly_once(self):
+        s = self.build()
+        for limit in (1, 2, 3, 10):
+            pages = self.walk(s, limit)
+            seqs = [e["commit_seq"] for p in pages for e in p["entries"]]
+            self.assertEqual(seqs, [1, 2, 3])
+            for page in pages:
+                self.assertEqual(page["upper_seq"], 3)
+                self.assertLessEqual(len(page["entries"]), limit)
+            self.assertIsNone(pages[-1]["next_seq"])
+            # empty commits are entries too and count toward the limit
+            self.assertEqual(
+                [e for p in pages for e in p["entries"]],
+                s.history(),
+            )
+
+    def test_exact_multiple_limit_ends_with_none_cursor(self):
+        s = self.build()
+        page = s.history_page(limit=3)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [1, 2, 3])
+        self.assertIsNone(page["next_seq"])
+
+    def test_empty_and_nonexistent_log_return_empty_page(self):
+        s = WalStore(self.path)  # path does not exist
+        page = s.history_page(limit=5)
+        self.assertEqual(
+            page, {"upper_seq": 0, "next_seq": None, "entries": []}
+        )
+        self.assertFalse(self.path.exists())
+        self.path.write_bytes(b"")
+        self.assertEqual(s.history_page(limit=5)["entries"], [])
+
+    def test_since_and_until_narrow_the_window(self):
+        s = self.build()
+        page = s.history_page(since_seq=1, until_seq=3, limit=5)
+        self.assertEqual(page["upper_seq"], 3)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [2, 3])
+        self.assertIsNone(page["next_seq"])
+        page = s.history_page(since_seq=2, until_seq=2, limit=5)
+        self.assertEqual(page["entries"], [])
+        self.assertIsNone(page["next_seq"])
+
+    def test_after_seq_is_an_exclusive_cursor(self):
+        s = self.build()
+        page = s.history_page(after_seq=1, limit=5)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [2, 3])
+        page = s.history_page(after_seq=3, limit=5)
+        self.assertEqual(page["entries"], [])
+        self.assertIsNone(page["next_seq"])
+        # both lower bounds apply: the effective start is the larger one
+        page = s.history_page(since_seq=2, after_seq=1, limit=5)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [3])
+
+    def test_later_commits_are_invisible_to_a_started_walk(self):
+        s = self.build()
+        first = s.history_page(limit=2)
+        s.set("d", 4)
+        s.commit()  # seq 4, after the walk started
+        second = s.history_page(
+            until_seq=first["upper_seq"], after_seq=first["next_seq"], limit=2
+        )
+        self.assertEqual(second["upper_seq"], 3)
+        self.assertEqual([e["commit_seq"] for e in second["entries"]], [3])
+        self.assertIsNone(second["next_seq"])
+        # the already-returned page is unchanged, and a fresh default call
+        # pins the new latest commit
+        self.assertEqual([e["commit_seq"] for e in first["entries"]], [1, 2])
+        self.assertEqual(s.history_page(limit=9)["upper_seq"], 4)
+
+    def test_uncommitted_tail_never_exported(self):
+        s = self.build()
+        for page in self.walk(s, 1):
+            for entry in page["entries"]:
+                for change in entry["changes"]:
+                    self.assertNotEqual(change.get("key"), "tail")
+        # a log with only uncommitted records has no history
+        self.write_lines({"op": "set", "key": "p", "value": 1, "seq": 1})
+        page = WalStore(self.path).history_page(limit=5)
+        self.assertEqual(
+            page, {"upper_seq": 0, "next_seq": None, "entries": []}
+        )
+
+    def test_invalid_arguments_raise_valueerror(self):
+        s = self.build()
+        for bad in (True, False, -1, 1.0, "1", b"1", [1], {"s": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.history_page(since_seq=bad, limit=1)
+            with self.assertRaises(ValueError, msg=bad):
+                s.history_page(until_seq=bad, limit=1)
+            with self.assertRaises(ValueError, msg=bad):
+                s.history_page(after_seq=bad, limit=1)
+        for bad_limit in (None, True, False, 0, -1, 1.0, "2", [1]):
+            with self.assertRaises(ValueError, msg=bad_limit):
+                s.history_page(limit=bad_limit)
+        with self.assertRaises(ValueError):
+            s.history_page()  # limit is required
+        with self.assertRaises(ValueError):
+            s.history_page(since_seq=2, until_seq=1, limit=1)  # inverted
+        # beyond the latest committed seq (latest is 3)
+        with self.assertRaises(ValueError):
+            s.history_page(since_seq=4, limit=1)
+        with self.assertRaises(ValueError):
+            s.history_page(until_seq=4, limit=1)
+        # cursor beyond the page's upper_seq
+        with self.assertRaises(ValueError):
+            s.history_page(after_seq=4, limit=1)
+        with self.assertRaises(ValueError):
+            s.history_page(until_seq=2, after_seq=3, limit=1)
+        # on an empty log any positive bound exceeds the latest seq
+        empty = WalStore(Path(self.dir.name) / "other.wal")
+        with self.assertRaises(ValueError):
+            empty.history_page(since_seq=1, limit=1)
+        with self.assertRaises(ValueError):
+            empty.history_page(after_seq=1, limit=1)
+
+    def test_argument_errors_precede_log_validation(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # corrupt record
+        with self.assertRaises(ValueError):
+            s.history_page(since_seq=-1, limit=1)
+        with self.assertRaises(ValueError):
+            s.history_page(limit=0)
+        with self.assertRaises(WalCorruptionError):
+            s.history_page(limit=1)
+
+    def test_closed_instance_raises_walclosederror_first(self):
+        s = self.build()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.history_page(limit=1)
+        with self.assertRaises(app.WalClosedError):
+            s.history_page(since_seq=-1, limit=0)
+
+    def test_result_is_independent_deep_copy(self):
+        s = self.build()
+        page = s.history_page(limit=2)
+        page["entries"][0]["changes"][1]["value"]["n"].append(99)
+        page["entries"].append({"commit_seq": 99, "changes": []})
+        again = s.history_page(limit=2)
+        self.assertEqual(len(again["entries"]), 2)
+        self.assertEqual(
+            again["entries"][0]["changes"][1]["value"], {"n": [1]}
+        )
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(WalStore(self.path).history_page(limit=2), again)
+
+    def test_history_page_is_read_only(self):
+        s = self.build()
+        size = self.log_size()
+        for kwargs in (
+            {"limit": 1},
+            {"since_seq": 1, "limit": 2},
+            {"until_seq": 2, "after_seq": 1, "limit": 2},
+        ):
+            s.history_page(**kwargs)
+        self.assertEqual(self.log_size(), size)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        self.assertEqual(s.recover()["pending_count"], 1)
+
+    def test_deterministic_across_calls_and_reopens(self):
+        s = self.build()
+        first = [dict(p) for p in self.walk(s, 2)]
+        for _ in range(3):
+            self.assertEqual([dict(p) for p in self.walk(s, 2)], first)
+            reopened = WalStore(self.path)
+            self.assertEqual([dict(p) for p in self.walk(reopened, 2)], first)
+
+    def test_corruption_anywhere_raises_no_partial_result(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # invalid, terminated
+        for kwargs in ({"limit": 1}, {"limit": 5}, {"after_seq": 2, "limit": 1}):
+            with self.assertRaises(WalCorruptionError, msg=kwargs):
+                s.history_page(**kwargs)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+
+    def test_tail_fragment_does_not_affect_history_page(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "frag"')  # interrupted write
+        size = self.log_size()
+        page = s.history_page(limit=5)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [1, 2, 3])
+        self.assertEqual(self.log_size(), size)  # fragment left in place
+
+    def test_strict_tail_raises_waltailerror(self):
+        s = self.build()
+        s.close()
+        self.append_bytes('{"op": "set", "key": "frag"')  # interrupted write
+        strict = WalStore(self.path)  # default mode tolerates the fragment
+        strict.close()
+        with self.assertRaises(app.WalTailError):
+            WalStore(self.path, strict_tail=True)
+        # repair, then a strict instance pages normally
+        fixer = WalStore(self.path)
+        fixer.repair_tail()
+        fixer.close()
+        strict = WalStore(self.path, strict_tail=True)
+        page = strict.history_page(limit=2)
+        self.assertEqual([e["commit_seq"] for e in page["entries"]], [1, 2])
+        strict.close()
+
+    def test_readonly_instance_serves_pages(self):
+        s = self.build()
+        s.rollback()  # settle the log for a clean read-only walk
+        s.close()
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(
+            [e["commit_seq"] for p in self.walk(ro, 2) for e in p["entries"]],
+            [1, 2, 3],
+        )
+        with self.assertRaises(app.WalReadOnlyError):
+            ro.commit()
+        ro.close()
+
+    def test_legacy_log_serves_history_page(self):
+        self.write_lines(
+            {"op": "set", "key": "k", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+            {"op": "set", "key": "k", "value": 2, "seq": 2},
+            {"op": "delete", "key": "k", "seq": 2},
+            {"op": "commit", "seq": 2},
+        )
+        s = WalStore(self.path)
+        page = s.history_page(limit=1)
+        self.assertEqual(
+            page["entries"],
+            [
+                {
+                    "commit_seq": 1,
+                    "changes": [{"op": "set", "key": "k", "value": 1}],
+                }
+            ],
+        )
+        page = s.history_page(
+            until_seq=page["upper_seq"], after_seq=page["next_seq"], limit=1
+        )
+        self.assertEqual(
+            page["entries"],
+            [
+                {
+                    "commit_seq": 2,
+                    "changes": [
+                        {"op": "set", "key": "k", "value": 2},
+                        {"op": "delete", "key": "k"},
+                    ],
+                }
+            ],
+        )
+        self.assertIsNone(page["next_seq"])
+
+
 class DiffTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
