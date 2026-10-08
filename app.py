@@ -406,6 +406,24 @@ def _json_equal(a, b):
     return a == b
 
 
+def _state_digest_payload(state):
+    """Canonical JSON byte representation hashed by state_digest.
+
+    Deterministic in every respect the fingerprint requires: object keys
+    are sorted by Unicode code point (sort_keys orders the decoded strings,
+    whose comparison is code-point order), no insignificant whitespace is
+    emitted (compact separators), non-ASCII content keeps the same escaping
+    json.dumps uses when the WAL writes records, and the result is UTF-8.
+    Values keep the JSON type they carry in the log: json.dumps renders
+    booleans as true/false rather than 1/0, so the states 1 and true hash
+    differently even nested inside arrays or objects, while the JSON
+    number family (int and float) keeps its ordinary numeric text.
+    """
+    return json.dumps(
+        state, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
 def _version_of_key(batches, key):
     """Commit seq of the last committed batch that set or deleted ``key``.
 
@@ -2278,6 +2296,89 @@ class WalStore:
             # once more in its constructor.
             boundary_state = dict(history_views)[target_seq]
         return WalView(target_seq, boundary_state)
+
+    def state_digest(self, target_seq=None):
+        """Stable SHA-256 fingerprint of one committed boundary's state.
+
+        The read-only counterpart of snapshot(): the whole log is first
+        validated and replayed under exactly the recover/history rules --
+        any unrecoverable UTF-8, JSON, field-set, seq, or integrity-chain
+        error raises WalCorruptionError with no partial fingerprint, an
+        integrity=True instance facing a non-empty unprotected legacy log
+        raises WalIntegrityError, and a strict_tail instance raises
+        WalTailError on a recover-recognised trailing fragment -- purely
+        into local objects, so a rejection never replaces the current
+        in-memory state or boundaries.
+
+        target_seq omitted or None selects the newest complete commit; 0
+        selects the empty state. Any other value must be a non-boolean
+        non-negative integer no greater than the latest committed seq,
+        otherwise ValueError is raised after validation (the log is always
+        proved readable before the target is chosen). Complete but
+        uncommitted set/delete records, the recover-recognised tail
+        fragment, and every commit after the target never contribute to
+        the fingerprint.
+
+        Returns a RecoveryResult with commit_seq (the selected seq) and
+        digest, a lower-case hexadecimal SHA-256 over the canonical JSON
+        of that boundary's complete key/value state: object keys sorted by
+        Unicode code point, UTF-8 encoded, no insignificant whitespace,
+        values keeping their JSON types -- 1 and true (also nested) hash
+        differently. The same committed state yields the same digest on
+        every open mode, after a process reopen, and across target_seq
+        selections.
+
+        The entry is purely observational: it never appends, truncates,
+        reorders, or creates the WAL file, never advances a seq, and never
+        changes state, pending_count, audit results, or the write boundary
+        a later append relies on (the cached accepted-prefix boundary is
+        restored exactly as scan/diff/audit do). It runs on a read-only
+        instance without a write lease. A closed instance raises
+        WalClosedError before target_seq is even checked.
+        """
+        self._check_open()
+        history_views = []
+        # Purely observational replay, exactly as in view, scan, diff,
+        # pending_changes, audit, and key_version: restore the cached
+        # accepted-prefix boundary so the fingerprint call can never
+        # influence a later append's decision to drop a tail fragment.
+        saved_valid_size = self._valid_size
+        try:
+            (
+                _candidate,
+                committed,
+                _pending_count,
+                _valid_size,
+                _committed_size,
+            ) = self._replay(snapshots=history_views)
+        finally:
+            self._valid_size = saved_valid_size
+        if target_seq is None:
+            target_seq = committed
+        elif (
+            isinstance(target_seq, bool)
+            or not isinstance(target_seq, int)
+            or target_seq < 0
+        ):
+            raise ValueError(
+                "target_seq must be a non-negative integer, got %r"
+                % (target_seq,)
+            )
+        if target_seq > committed:
+            raise ValueError(
+                "target_seq %r exceeds latest committed seq %r"
+                % (target_seq, committed)
+            )
+        if target_seq == 0:
+            boundary_state = {}
+        else:
+            # Commit seqs are contiguous from 1; the recorded snapshot is
+            # already a deep copy private to this replay.
+            boundary_state = dict(history_views)[target_seq]
+        digest = hashlib.sha256(
+            _state_digest_payload(boundary_state)
+        ).hexdigest()
+        return RecoveryResult(commit_seq=target_seq, digest=digest)
 
     def history(self, since_seq=0, until_seq=None):
         """Read-only export of committed change batches, in commit order.

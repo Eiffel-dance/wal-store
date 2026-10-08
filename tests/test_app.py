@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -2735,6 +2736,389 @@ class DiffTest(unittest.TestCase):
         self.assertEqual(
             s.diff(0, 1)["changes"], [{"op": "set", "key": "k", "value": 1}]
         )
+
+
+class StateDigestTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.dir.name) / "store.wal"
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_lines(self, *rows):
+        with self.path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(row if isinstance(row, str) else json.dumps(row))
+                f.write("\n")
+
+    def append_bytes(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.path.open("ab") as f:
+            f.write(data)
+
+    def log_size(self):
+        return self.path.stat().st_size if self.path.exists() else 0
+
+    @staticmethod
+    def canonical(state):
+        return json.dumps(
+            state, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    def assert_digest_of(self, result, seq, state):
+        self.assertEqual(set(result), {"commit_seq", "digest"})
+        self.assertEqual(result["commit_seq"], seq)
+        self.assertEqual(
+            result["digest"], hashlib.sha256(self.canonical(state)).hexdigest()
+        )
+        self.assertRegex(result["digest"], r"^[0-9a-f]{64}$")
+
+    def build(self):
+        s = WalStore(self.path)
+        s.set("a", 1)
+        s.set("b", {"n": [1]})
+        s.commit()  # seq 1: {"a": 1, "b": {"n": [1]}}
+        s.delete("a")
+        s.set("c", 3)
+        s.commit()  # seq 2: {"b": {"n": [1]}, "c": 3}
+        s.commit()  # seq 3: empty commit, same state
+        s.set("tail", 9)  # uncommitted
+        return s
+
+    def test_empty_state_has_stable_digest(self):
+        s = WalStore(self.path)  # nonexistent log
+        self.assert_digest_of(s.state_digest(), 0, {})
+        self.assert_digest_of(s.state_digest(None), 0, {})
+        self.assert_digest_of(s.state_digest(0), 0, {})
+        self.assertFalse(self.path.exists())  # no file is created
+        self.path.write_bytes(b"")
+        self.assert_digest_of(WalStore(self.path).state_digest(), 0, {})
+
+    def test_default_targets_latest_commit(self):
+        s = self.build()
+        latest = {"b": {"n": [1]}, "c": 3}
+        self.assert_digest_of(s.state_digest(), 3, latest)
+        self.assert_digest_of(s.state_digest(None), 3, latest)
+
+    def test_historical_boundaries_and_zero(self):
+        s = self.build()
+        self.assert_digest_of(s.state_digest(0), 0, {})
+        self.assert_digest_of(
+            s.state_digest(1), 1, {"a": 1, "b": {"n": [1]}}
+        )
+        state2 = {"b": {"n": [1]}, "c": 3}
+        self.assert_digest_of(s.state_digest(2), 2, state2)
+        # seq 3 is an empty commit: same state, identical fingerprint
+        self.assertEqual(
+            s.state_digest(3)["digest"], s.state_digest(2)["digest"]
+        )
+
+    def test_uncommitted_records_and_fragment_are_invisible(self):
+        s = self.build()
+        states = {
+            0: {},
+            1: {"a": 1, "b": {"n": [1]}},
+            2: {"b": {"n": [1]}, "c": 3},
+            3: {"b": {"n": [1]}, "c": 3},
+        }
+        latest = s.state_digest()
+        # complete but uncommitted records do not move the fingerprint
+        s.set("pending", {"x": [True, None]})
+        s.delete("b")
+        self.assertEqual(s.state_digest(), latest)
+        # a recover-recognised tail fragment is likewise invisible
+        self.append_bytes('{"op": "set", "key": "frag"')
+        size_after_fragment = self.log_size()
+        for target in (None, 0, 1, 2, 3):
+            result = s.state_digest() if target is None else s.state_digest(target)
+            seq = 3 if target is None else target
+            self.assertEqual(result["commit_seq"], seq)
+            self.assertEqual(
+                result["digest"],
+                hashlib.sha256(self.canonical(states[seq])).hexdigest(),
+            )
+        # digest calls leave every pending and fragment byte in place
+        self.assertEqual(self.log_size(), size_after_fragment)
+
+    def test_commits_after_target_do_not_contribute(self):
+        s = self.build()
+        at2 = s.state_digest(2)
+        s.set("d", 4)
+        s.commit()  # seq 4
+        s.set("e", 5)
+        s.commit()  # seq 5
+        self.assertEqual(s.state_digest(2), at2)
+        self.assertEqual(s.state_digest().commit_seq, 5)
+        self.assertNotEqual(s.state_digest().digest, at2.digest)
+
+    def test_canonical_json_type_distinctions(self):
+        # 1 vs true hash differently, at top level and nested
+        s = WalStore(self.path)
+        s.set("k", 1)
+        s.commit()
+        number = s.state_digest().digest
+        s.set("k", True)
+        s.commit()
+        boolean = s.state_digest().digest
+        self.assertNotEqual(number, boolean)
+        s.set("k", {"a": [1]})
+        s.commit()
+        nested_number = s.state_digest().digest
+        s.set("k", {"a": [True]})
+        s.commit()
+        nested_boolean = s.state_digest().digest
+        self.assertNotEqual(nested_number, nested_boolean)
+        # null, false, strings, floats, and nested containers each keep
+        # their own JSON type in the fingerprint
+        for index, value in enumerate(
+            (None, False, "1", 1.0, [1], {"k": 1})
+        ):
+            store = WalStore(self.path.parent / ("v-%d.wal" % index))
+            store.set("k", True)
+            store.set("v", value)
+            store.commit()
+            self.assertEqual(
+                store.state_digest().digest,
+                hashlib.sha256(
+                    self.canonical({"k": True, "v": value})
+                ).hexdigest(),
+                msg=value,
+            )
+        # empty collections are distinguishable states
+        s.set("v", {})
+        s.commit()
+        empty_object = s.state_digest().digest
+        s.set("v", [])
+        s.commit()
+        empty_array = s.state_digest().digest
+        self.assertNotEqual(empty_object, empty_array)
+
+    def test_canonical_key_order_and_unicode(self):
+        s = WalStore(self.path)
+        state = {"中": 1, "A": 2, "é": 3, "": 4}
+        for key in state:
+            s.set(key, state[key])
+        s.commit()
+        self.assert_digest_of(s.state_digest(), 1, state)
+        # insertion order into the log must not matter: a hand-written log
+        # in reverse key order hashes identically
+        ordered = [
+            {"op": "set", "key": key, "value": state[key], "seq": 1}
+            for key in sorted(state, reverse=True)
+        ]
+        ordered.append({"op": "commit", "seq": 1})
+        self.write_lines(*ordered)
+        self.assertEqual(
+            WalStore(self.path).state_digest().digest,
+            hashlib.sha256(self.canonical(state)).hexdigest(),
+        )
+
+    def test_deterministic_across_modes_and_reopens(self):
+        s = self.build()
+        first = s.state_digest(2)
+        for _ in range(3):
+            self.assertEqual(s.state_digest(2), first)
+        for kwargs in ({}, {"readonly": True}, {"exclusive": True}):
+            store = WalStore(self.path, **kwargs)
+            self.assertEqual(store.state_digest(2), first, msg=kwargs)
+            store.close()
+        # protected log carrying the same committed state
+        protected_path = self.path.parent / "protected.wal"
+        ps = WalStore(protected_path, integrity=True)
+        ps.set("a", 1)
+        ps.set("b", {"n": [1]})
+        ps.commit()
+        ps.delete("a")
+        ps.set("c", 3)
+        ps.commit()
+        legacy_path = self.path.parent / "legacy.wal"
+        ls = WalStore(legacy_path)
+        ls.set("a", 1)
+        ls.set("b", {"n": [1]})
+        ls.commit()
+        ls.delete("a")
+        ls.set("c", 3)
+        ls.commit()
+        self.assertEqual(
+            ps.state_digest().digest, ls.state_digest().digest
+        )
+        ps.close()
+
+    def test_digest_matches_snapshot_state(self):
+        s = self.build()
+        for target in (None, 0, 1, 2, 3):
+            snap = s.snapshot() if target is None else s.snapshot(target)
+            digest_result = (
+                s.state_digest() if target is None else s.state_digest(target)
+            )
+            self.assertEqual(snap["commit_seq"], digest_result["commit_seq"])
+            self.assertEqual(
+                digest_result["digest"],
+                hashlib.sha256(self.canonical(snap["state"])).hexdigest(),
+            )
+
+    def test_stable_across_fresh_process(self):
+        s = self.build()
+        expected = s.state_digest(2).digest
+        repo = os.path.dirname(os.path.abspath(app.__file__))
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]);\n"
+            "import app; from pathlib import Path;\n"
+            "print(app.WalStore(Path(sys.argv[2])).state_digest(2).digest)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, repo, str(self.path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), expected)
+
+    def test_invalid_target_seq_raises_valueerror(self):
+        s = self.build()
+        for bad in (True, False, -1, 1.0, "1", b"1", [1], {"s": 1}):
+            with self.assertRaises(ValueError, msg=bad):
+                s.state_digest(bad)
+        with self.assertRaises(ValueError):
+            s.state_digest(4)
+        with self.assertRaises(ValueError):
+            s.state_digest(10**9)
+        # empty log only admits seq 0
+        empty = WalStore(self.path.parent / "empty.wal")
+        with self.assertRaises(ValueError):
+            empty.state_digest(1)
+
+    def test_closed_instance_raises_before_argument_check(self):
+        s = self.build()
+        s.close()
+        with self.assertRaises(app.WalClosedError):
+            s.state_digest()
+        with self.assertRaises(app.WalClosedError):
+            s.state_digest(-1)
+        with self.assertRaises(app.WalClosedError):
+            s.state_digest(True)
+
+    def test_corruption_raises_without_partial_fingerprint(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "x"}\n')  # invalid, terminated
+        for target in (None, 0, 1, 2, 3):
+            with self.assertRaises(WalCorruptionError, msg=target):
+                s.state_digest() if target is None else s.state_digest(target)
+        # in-memory state and seqs untouched
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+
+    def test_strict_tail_fragment_raises_wal_tail_error(self):
+        s = self.build()
+        size = self.log_size()
+        strict = WalStore(self.path, strict_tail=True)
+        self.append_bytes('{"op": "set", "key": "frag"')
+        with self.assertRaises(app.WalTailError):
+            strict.state_digest()
+        # the fragment stays in place and the default mode still digests
+        self.assertEqual(self.log_size(), size + len(b'{"op": "set", "key": "frag"'))
+        self.assertEqual(
+            s.state_digest(2).digest,
+            hashlib.sha256(
+                self.canonical({"b": {"n": [1]}, "c": 3})
+            ).hexdigest(),
+        )
+        strict.close()
+
+    def test_truncated_utf8_fragment_is_invisible(self):
+        s = self.build()
+        expected = s.state_digest()
+        # an unterminated record ending in a cut multi-byte UTF-8 sequence:
+        # é is 0xC3 0xA9 in UTF-8; append only the lead byte 0xC3
+        self.append_bytes(b'{"op": "set", "key": "\xc3')
+        self.assertEqual(s.state_digest(), expected)
+
+    def test_integrity_mode_refuses_unprotected_legacy_log(self):
+        self.write_lines(
+            {"op": "set", "key": "a", "value": 1, "seq": 1},
+            {"op": "commit", "seq": 1},
+        )
+        before = self.path.read_bytes()
+        # construction replays, so an integrity=True open on a non-empty
+        # unprotected log never hands out an instance; state_digest is
+        # never reachable on one
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True)
+        self.assertEqual(self.path.read_bytes(), before)
+        with self.assertRaises(app.WalIntegrityError):
+            WalStore(self.path, integrity=True, readonly=True)
+        # the same refusal surfaces from state_digest's own replay when an
+        # open default-mode instance finds an unprotected log added under
+        # it: open while empty, then drop a legacy log at the path
+        live_path = self.path.parent / "live.wal"
+        s = WalStore(live_path, integrity=True)
+        with live_path.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"op": "set", "key": "a", "value": 1, "seq": 1}
+            ))
+            f.write("\n")
+            f.write(json.dumps({"op": "commit", "seq": 1}))
+            f.write("\n")
+        with self.assertRaises(app.WalIntegrityError):
+            s.state_digest()
+
+    def test_protected_log_digest_checks_chain(self):
+        ps = WalStore(self.path, integrity=True)
+        ps.set("a", 1)
+        ps.commit()
+        self.assert_digest_of(ps.state_digest(), 1, {"a": 1})
+        # tamper with a protected record's integrity field
+        lines = self.path.read_text(encoding="utf-8").splitlines(keepends=True)
+        record = json.loads(lines[0])
+        record["value"] = 2
+        lines[0] = json.dumps(record, sort_keys=True) + "\n"
+        self.path.write_text("".join(lines), encoding="utf-8")
+        with self.assertRaises(WalCorruptionError):
+            ps.state_digest()
+
+    def test_purely_observational_side_effects(self):
+        s = self.build()
+        self.append_bytes('{"op": "set", "key": "frag"')
+        size = self.log_size()
+        audit_before = s.audit()
+        for target in (None, 0, 1, 2, 3):
+            if target is None:
+                s.state_digest()
+            else:
+                s.state_digest(target)
+        self.assertEqual(self.log_size(), size)
+        self.assertEqual(s.audit(), audit_before)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3})
+        self.assertEqual(s.commit_seq, 3)
+        pending = s.pending_changes()
+        self.assertEqual(pending["commit_seq"], 3)
+        self.assertEqual(pending["pending_count"], 1)
+        # the cached accepted-prefix boundary still lets the next append
+        # discard the fragment rather than corrupt the log
+        s.set("z", 9)
+        self.assertEqual(s.commit(), 4)
+        self.assertEqual(s.state, {"b": {"n": [1]}, "c": 3, "tail": 9, "z": 9})
+        self.assertNotIn(b"frag", self.path.read_bytes())
+
+    def test_readonly_instance_serves_digest_without_lease(self):
+        s = self.build()
+        size = self.log_size()
+        ro = WalStore(self.path, readonly=True)
+        self.assertEqual(ro.state_digest(), s.state_digest())
+        self.assertEqual(ro.state_digest(0).commit_seq, 0)
+        self.assertEqual(self.log_size(), size)
+        # a read-only instance can read even while an exclusive writer
+        # holds the lease
+        writer = WalStore(self.path, exclusive=True)
+        reader = WalStore(self.path, readonly=True)
+        self.assertEqual(
+            reader.state_digest(2).digest, s.state_digest(2).digest
+        )
+        writer.close()
+        ro.close()
 
 
 class ExclusiveLeaseTest(unittest.TestCase):
