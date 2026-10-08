@@ -2351,6 +2351,164 @@ class WalStore:
             if since_seq < seq <= until_seq
         ]
 
+    def history_page(self, since_seq=0, until_seq=None, after_seq=0, limit=None):
+        """Read-only, cursor-stable single page of committed change batches.
+
+        The paginated counterpart of history(): the same since_seq /
+        until_seq window semantics -- only commits with
+        since_seq < commit_seq <= upper_seq are visible, an empty commit
+        yields an empty changes list, and changes preserve the batch's
+        log write order -- plus an exclusive after_seq cursor and a
+        positive-integer page cap. after_seq defaults to 0 and selects
+        entries strictly above it, so a page lists at most limit commits
+        with max(since_seq, after_seq) < commit_seq <= upper_seq, in
+        ascending commit seq.
+
+        until_seq omitted fixes upper_seq for this result to the latest
+        committed seq visible under the full recovery rules at call time;
+        subsequent requests pass that same upper_seq and the previous
+        result's next_seq, so commits landing between pages can never
+        enter or alter an earlier page. next_seq is the commit_seq of
+        the page's last entry when further entries remain within
+        upper_seq, and None once the window is exhausted; asking again
+        with the terminal cursor returns an empty entries list and
+        next_seq None.
+
+        Every argument is form-validated before the log is read:
+        since_seq, until_seq (when given), and after_seq must be
+        non-boolean non-negative integers, since_seq must not exceed an
+        explicit until_seq, and limit must be a non-boolean positive
+        integer (None, booleans, zero, negatives, and non-integers all
+        raise ValueError); a closed instance raises WalClosedError
+        before any of these checks. The whole log is then validated
+        under the exact recovery rules -- illegal UTF-8, non-standard
+        JSON, duplicate or missing fields, and seq corruption raise
+        WalCorruptionError; a strict_tail instance raises WalTailError
+        on a recover-recognised trailing fragment; uncommitted
+        set/delete records stay invisible exactly as for history.
+        After the replay, since_seq or an explicit until_seq beyond the
+        latest committed seq, or an after_seq beyond upper_seq, raises
+        ValueError.
+
+        The returned mapping -- upper_seq, next_seq, entries -- and
+        every nested value are independent deep copies private to the
+        call. The page never appends, truncates, or rewrites the log,
+        never creates a missing file, and advances no seq, so the same
+        commit boundaries page identically across calls and reopens.
+        """
+        self._check_open()
+        # Reject every argument form error before the log is ever read,
+        # exactly as history() does: a rejected call must never read,
+        # create, truncate, or append to the file.
+        if (
+            isinstance(since_seq, bool)
+            or not isinstance(since_seq, int)
+            or since_seq < 0
+        ):
+            raise ValueError(
+                "since_seq must be a non-negative integer, got %r" % (since_seq,)
+            )
+        if until_seq is not None and (
+            isinstance(until_seq, bool)
+            or not isinstance(until_seq, int)
+            or until_seq < 0
+        ):
+            raise ValueError(
+                "until_seq must be a non-negative integer, got %r" % (until_seq,)
+            )
+        if (
+            isinstance(after_seq, bool)
+            or not isinstance(after_seq, int)
+            or after_seq < 0
+        ):
+            raise ValueError(
+                "after_seq must be a non-negative integer, got %r" % (after_seq,)
+            )
+        # limit is mandatory in effect: None (omitted) is refused like
+        # every non-positive or non-integer value, so a page always has
+        # a fixed positive cap.
+        if (
+            limit is None
+            or isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+        ):
+            raise ValueError(
+                "limit must be a positive integer, got %r" % (limit,)
+            )
+        if until_seq is not None and since_seq > until_seq:
+            raise ValueError(
+                "since_seq %r exceeds until_seq %r" % (since_seq, until_seq)
+            )
+        # A cursor beyond an explicit upper bound is a pure form error
+        # (upper_seq is unknown only when until_seq is omitted, so that
+        # remaining case is re-checked once the replay fixes it).
+        if until_seq is not None and after_seq > until_seq:
+            raise ValueError(
+                "after_seq %r exceeds until_seq %r" % (after_seq, until_seq)
+            )
+        batches = []
+        # Purely observational replay, exactly as in scan, diff,
+        # pending_changes, view, and audit: restore the cached
+        # accepted-prefix boundary so serving a page can never influence
+        # a later append's decision to drop a tail fragment, and never
+        # advance a seq. The replay builds only local objects, so
+        # WalCorruptionError/WalTailError/WalIntegrityError propagate
+        # with nothing adopted.
+        saved_valid_size = self._valid_size
+        try:
+            (
+                _candidate,
+                committed,
+                _pending_count,
+                _valid_size,
+                _committed_size,
+            ) = self._replay(batches=batches)
+        finally:
+            self._valid_size = saved_valid_size
+        # Pinning upper_seq at call time is what freezes the page
+        # against later commits: the next request carries the same
+        # value, so the replay's newer latest seq can never widen the
+        # window.
+        upper_seq = committed if until_seq is None else until_seq
+        if since_seq > committed:
+            raise ValueError(
+                "since_seq %r exceeds latest committed seq %r"
+                % (since_seq, committed)
+            )
+        if until_seq is not None and until_seq > committed:
+            raise ValueError(
+                "until_seq %r exceeds latest committed seq %r"
+                % (until_seq, committed)
+            )
+        if after_seq > upper_seq:
+            raise ValueError(
+                "after_seq %r exceeds upper_seq %r" % (after_seq, upper_seq)
+            )
+        # Commit seqs are contiguous from 1; the window over the
+        # replay-private batch list is therefore already in ascending
+        # commit order. Both bounds are exclusive below / inclusive
+        # above, matching history, with the cursor adding a second
+        # exclusive lower bound.
+        window = [
+            {"commit_seq": seq, "changes": changes}
+            for seq, changes in batches
+            if since_seq < seq <= upper_seq and after_seq < seq
+        ]
+        page = window[:limit]
+        # More entries remain within the frozen window exactly when the
+        # cap cut the window short; the last served seq is the cursor
+        # for the next page.
+        next_seq = page[-1]["commit_seq"] if len(window) > len(page) else None
+        # One more independent deep copy of the served page and all its
+        # nested values: the caller must never share an object with the
+        # replay, the store, a later page, or a reopened instance.
+        return RecoveryResult(
+            upper_seq=upper_seq,
+            next_seq=next_seq,
+            entries=copy.deepcopy(page),
+        )
+
     def diff(self, from_seq, to_seq):
         """Read-only key-level diff between two committed states.
 
